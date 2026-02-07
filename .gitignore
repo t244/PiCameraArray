@@ -105,3 +105,6 @@ venv.bak/
 # OS
 .DS_Store
 Thumbs.db
+
+# Data acquisition logs and captures
+data/

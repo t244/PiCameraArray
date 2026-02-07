@@ -28,7 +28,7 @@ from dataclasses import dataclass
 @dataclass
 class CaptureConfig:
     """Configuration for triggered capture"""
-    storage_path: str = "/home/pi/PiCameraArray/data"
+    storage_path: str = f"/home/pi/PiCameraArray/data/{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     image_format: str = "png"
     image_width: int = 1456
     image_height: int = 1088
@@ -38,7 +38,7 @@ class CaptureConfig:
     max_temperature: float = 80.0
     temp_warning: float = 75.0
     check_interval: int = 50  # Check health every N captures
-    log_file: str = "/home/pi/PiCameraArray/data/capture.log"
+    log_file: str = f"{storage_path}/capture.log"
     log_to_console: bool = True
 
 
@@ -226,8 +226,9 @@ class TriggerCapture:
             # Generate filename if not provided
             if filename is None:
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-                filename = (f"{self.hostname}_{self.session_id}_"
-                           f"{self.capture_count:06d}_{timestamp}.{self.config.image_format}")
+                filename = (f"{self.hostname}_"
+                           f"{self.capture_count:06d}_"
+                           f"{timestamp}.{self.config.image_format}")
             
             filepath = os.path.join(self.config.storage_path, filename)
             
