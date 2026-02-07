@@ -21,6 +21,7 @@ import os
 import logging
 from typing import Optional, Tuple
 from dataclasses import dataclass
+import sys
 
 
 # ==================== CONFIGURATION ====================
@@ -377,6 +378,13 @@ class TriggerCapture:
         }
 
 
+# ==================== SIGNAL HANDLER ====================
+
+def signal_handler(sig, frame):
+    """Signal handler for graceful shutdown"""
+    print("\nShutting down...")
+    sys.exit(0)
+
 # ==================== MAIN FUNCTION ====================
 
 def main():
@@ -404,4 +412,6 @@ def main():
 # ==================== SCRIPT ENTRY POINT ====================
 
 if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
     exit(main())
