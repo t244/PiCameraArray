@@ -1,0 +1,14 @@
+[Unit]
+Description=PiCameraArray Trigger Capture Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/pi/PiCameraArray/capture
+ExecStart=/home/pi/PiCameraArray/capture/startup.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
