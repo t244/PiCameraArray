@@ -9,6 +9,7 @@ WorkingDirectory=/home/pi/PiCameraArray/capture
 ExecStart=/home/pi/PiCameraArray/capture/startup.sh
 Restart=on-failure
 RestartSec=5
+KillMode=mixed
 
 [Install]
 WantedBy=multi-user.target
