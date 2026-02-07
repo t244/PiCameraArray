@@ -162,7 +162,6 @@ class TriggerCapture:
         self.logger = setup_logger(self.config)
         self.camera: Optional[Picamera2] = None
         self.hostname = get_hostname()
-        self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.capture_count = 0
         self.running = False
         self._timeout_occurred = False
@@ -371,7 +370,6 @@ class TriggerCapture:
         """
         return {
             'hostname': self.hostname,
-            'session_id': self.session_id,
             'capture_count': self.capture_count,
             'storage_usage': get_storage_usage(self.config.storage_path),
             'cpu_temp': get_cpu_temp(),
