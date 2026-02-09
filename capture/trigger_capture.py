@@ -22,6 +22,7 @@ import logging
 from typing import Optional, Tuple
 from dataclasses import dataclass
 import sys
+import threading
 
 
 # ==================== CONFIGURATION ====================
@@ -175,10 +176,15 @@ class TriggerCapture:
     
     def _shutdown_handler(self, signum, frame):
         """Signal handler for graceful shutdown (Ctrl-C)"""
-        self.logger.info("\nShutdown requested (Ctrl-C)")
+        self.logger.info("\nShutdown requested (Ctrl-C) - stopping camera and exiting...")
         self._shutdown_requested = True
         self.running = False
-        raise KeyboardInterrupt()
+        
+        # Immediately stop and close camera
+        self.stop()
+        
+        # Exit immediately
+        sys.exit(0)
     
     def initialize_camera(self) -> bool:
         """
@@ -382,14 +388,31 @@ class TriggerCapture:
         
         if self.camera:
             try:
-                # Temporarily ignore signals during camera cleanup to ensure it completes
+                # Temporarily ignore signals during camera cleanup
                 old_sigint_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
                 old_sigterm_handler = signal.signal(signal.SIGTERM, signal.SIG_IGN)
                 
                 try:
-                    self.camera.stop()
-                    self.camera.close()
-                    self.logger.info("Camera closed")
+                    # Try to stop camera with a timeout using threading
+                    # This prevents hanging if camera is waiting for a trigger
+                    def _stop_camera():
+                        try:
+                            self.camera.stop()
+                            self.camera.close()
+                        except Exception as e:
+                            self.logger.debug(f"Exception during camera stop: {e}")
+                    
+                    stop_thread = threading.Thread(target=_stop_camera, daemon=True)
+                    stop_thread.start()
+                    
+                    # Wait up to 3 seconds for camera to stop
+                    stop_thread.join(timeout=3.0)
+                    
+                    if stop_thread.is_alive():
+                        self.logger.warning("Camera stop timed out - forcing exit")
+                    else:
+                        self.logger.info("Camera closed")
+                        
                 finally:
                     # Restore original signal handlers
                     signal.signal(signal.SIGINT, old_sigint_handler)
