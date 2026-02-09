@@ -166,11 +166,18 @@ class TriggerCapture:
         self.capture_count = 0
         self.running = False
         self._timeout_occurred = False
+        self._shutdown_requested = False
     
     def _timeout_handler(self, signum, frame):
         """Signal handler for timeout"""
         self._timeout_occurred = True
         raise TimeoutException()
+    
+    def _shutdown_handler(self, signum, frame):
+        """Signal handler for graceful shutdown (Ctrl-C)"""
+        self.logger.info("\nShutdown requested (Ctrl-C)")
+        self._shutdown_requested = True
+        self.running = False
     
     def initialize_camera(self) -> bool:
         """
@@ -324,21 +331,26 @@ class TriggerCapture:
         self.logger.info("Press Ctrl+C to stop")
         self.logger.info("="*50)
         
+        # Register signal handlers for graceful shutdown
+        signal.signal(signal.SIGINT, self._shutdown_handler)
+        signal.signal(signal.SIGTERM, self._shutdown_handler)
+        
         self.running = True
         self.capture_count = 0
         
         try:
-            while self.running:
+            while self.running and not self._shutdown_requested:
                 # Periodic health check
                 if self.capture_count % self.config.check_interval == 0 and self.capture_count > 0:
                     if not self.check_system_health():
                         break
                 
                 # Capture image
-                self.capture_single()
+                if not self._shutdown_requested:
+                    self.capture_single()
         
-        except KeyboardInterrupt:
-            self.logger.info("Stopped by user")
+        except Exception as e:
+            self.logger.error(f"Unexpected error in capture loop: {e}")
         
         finally:
             self.stop()
@@ -378,13 +390,6 @@ class TriggerCapture:
         }
 
 
-# ==================== SIGNAL HANDLER ====================
-
-def signal_handler(sig, frame):
-    """Signal handler for graceful shutdown"""
-    print("\nShutting down...")
-    sys.exit(0)
-
 # ==================== MAIN FUNCTION ====================
 
 def main():
@@ -412,6 +417,4 @@ def main():
 # ==================== SCRIPT ENTRY POINT ====================
 
 if __name__ == "__main__":
-    signal.signal(signal.SIGTERM, signal_handler)
-    signal.signal(signal.SIGINT, signal_handler)
     exit(main())
