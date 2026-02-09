@@ -179,12 +179,7 @@ class TriggerCapture:
         self.logger.info("\nShutdown requested (Ctrl-C) - stopping camera and exiting...")
         self._shutdown_requested = True
         self.running = False
-        
-        # Immediately stop and close camera
-        self.stop()
-        
-        # Exit immediately
-        sys.exit(0)
+        raise KeyboardInterrupt()
     
     def initialize_camera(self) -> bool:
         """
