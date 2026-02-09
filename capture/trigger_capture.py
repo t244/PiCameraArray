@@ -178,9 +178,6 @@ class TriggerCapture:
         self.logger.info("\nShutdown requested (Ctrl-C)")
         self._shutdown_requested = True
         self.running = False
-        # Reset signal handlers to default to allow immediate exit on subsequent Ctrl-C
-        signal.signal(signal.SIGINT, signal.default_int_handler)
-        signal.signal(signal.SIGTERM, signal.SIG_DFL)
         raise KeyboardInterrupt()
     
     def initialize_camera(self) -> bool:
@@ -385,9 +382,19 @@ class TriggerCapture:
         
         if self.camera:
             try:
-                self.camera.stop()
-                self.camera.close()
-                self.logger.info("Camera closed")
+                # Temporarily ignore signals during camera cleanup to ensure it completes
+                old_sigint_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
+                old_sigterm_handler = signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                
+                try:
+                    self.camera.stop()
+                    self.camera.close()
+                    self.logger.info("Camera closed")
+                finally:
+                    # Restore original signal handlers
+                    signal.signal(signal.SIGINT, old_sigint_handler)
+                    signal.signal(signal.SIGTERM, old_sigterm_handler)
+                    
             except Exception as e:
                 self.logger.error(f"Error closing camera: {e}")
     
