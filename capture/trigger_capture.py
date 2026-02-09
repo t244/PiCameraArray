@@ -178,6 +178,7 @@ class TriggerCapture:
         self.logger.info("\nShutdown requested (Ctrl-C)")
         self._shutdown_requested = True
         self.running = False
+        raise KeyboardInterrupt()
     
     def initialize_camera(self) -> bool:
         """
@@ -267,7 +268,16 @@ class TriggerCapture:
                     f"✗ Timeout - no trigger received in {self.config.trigger_timeout}s"
                 )
                 return False, None
+            
+            except KeyboardInterrupt:
+                # Shutdown requested - propagate the interrupt
+                signal.alarm(0)
+                raise
                 
+        except KeyboardInterrupt:
+            signal.alarm(0)  # Make sure to cancel alarm
+            raise
+            
         except Exception as e:
             signal.alarm(0)  # Make sure to cancel alarm
             self.logger.error(f"Capture failed: {e}")
@@ -348,6 +358,10 @@ class TriggerCapture:
                 # Capture image
                 if not self._shutdown_requested:
                     self.capture_single()
+        
+        except KeyboardInterrupt:
+            # Expected shutdown from Ctrl-C
+            pass
         
         except Exception as e:
             self.logger.error(f"Unexpected error in capture loop: {e}")
