@@ -34,7 +34,7 @@ class CaptureConfig:
     image_width: int = 1456
     image_height: int = 1088
     trigger_timeout: float = 60.0  # seconds
-    buffer_count: int = 1
+    buffer_count: int = 10
     max_storage_percent: float = 95.0
     max_temperature: float = 80.0
     temp_warning: float = 75.0
@@ -223,15 +223,6 @@ class TriggerCapture:
             return False, None
         
         try:
-            # Generate filename if not provided
-            if filename is None:
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-                filename = (f"{self.hostname}_"
-                           f"{self.capture_count:06d}_"
-                           f"{timestamp}.{self.config.image_format}")
-            
-            filepath = os.path.join(self.config.storage_path, filename)
-            
             # Setup timeout
             self._timeout_occurred = False
             signal.signal(signal.SIGALRM, self._timeout_handler)
@@ -243,6 +234,15 @@ class TriggerCapture:
                 
                 # Cancel alarm - we got the frame
                 signal.alarm(0)
+    
+                # Generate filename if not provided
+                if filename is None:
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+                    filename = (f"{self.hostname}_"
+                            f"{self.capture_count:06d}_"
+                            f"{timestamp}.{self.config.image_format}")
+                
+                filepath = os.path.join(self.config.storage_path, filename)
                 
                 # Save image
                 request.save("main", filepath)
