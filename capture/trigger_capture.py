@@ -178,6 +178,9 @@ class TriggerCapture:
         self.logger.info("\nShutdown requested (Ctrl-C)")
         self._shutdown_requested = True
         self.running = False
+        # Reset signal handlers to default to allow immediate exit on subsequent Ctrl-C
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
         raise KeyboardInterrupt()
     
     def initialize_camera(self) -> bool:
