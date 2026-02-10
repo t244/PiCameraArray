@@ -7,3 +7,7 @@ sudo chmod +x /home/pi/PiCameraArray/capture/startup.sh
 sudo cp /home/pi/PiCameraArray/config/picamera-capture.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable picamera-capture.service
+
+# Create data directory for captured images
+sudo mkdir -p /home/pi/PiCameraArray/data
+sudo chown -R pi:pi /home/pi/PiCameraArray/data

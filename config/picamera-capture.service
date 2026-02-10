@@ -1,11 +1,13 @@
 [Unit]
 Description=PiCameraArray Trigger Capture Service
-After=network.target
+After=local-fs.target
 
 [Service]
 Type=simple
 User=root
+Group=root
 WorkingDirectory=/home/pi/PiCameraArray/capture
+ExecStartPre=/bin/sleep 10
 ExecStart=/home/pi/PiCameraArray/capture/startup.sh
 Restart=on-failure
 RestartSec=5
