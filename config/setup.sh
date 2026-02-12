@@ -5,8 +5,8 @@ sudo apt update && sudo apt full-upgrade -y
 sudo apt install -y libcamera-apps python3-picamera2
 
 # Enable Wayland service
-sudo systemctl enable wayland.service
-sudo systemctl start wayland.service
+sudo systemctl enable wayvnc.service
+sudo systemctl start wayvnc.service
 
 # Set up VNC headless display
 echo "" | sudo tee -a /boot/firmware/config.txt
