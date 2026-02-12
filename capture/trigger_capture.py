@@ -30,18 +30,34 @@ import threading
 @dataclass
 class CaptureConfig:
     """Configuration for triggered capture"""
-    storage_path: str = f"/home/pi/PiCameraArray/data/{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    storage_path: str = None
     image_format: str = "png"
     image_width: int = 1456
     image_height: int = 1088
-    trigger_timeout: float = 60.0  # seconds
+    trigger_timeout: float = 600.0
     buffer_count: int = 10
     max_storage_percent: float = 95.0
     max_temperature: float = 80.0
     temp_warning: float = 75.0
-    check_interval: int = 50  # Check health every N captures
-    log_file: str = f"{storage_path}/capture.log"
+    check_interval: int = 50
+    log_file: str = None
     log_to_console: bool = True
+    
+    def __post_init__(self):
+        """Set storage path and log file after initialization"""
+        if self.storage_path is None:
+            # Check if SSD is mounted
+            ssd_mount = "/media/pi/HIKSEMI"
+            if os.path.isdir(ssd_mount) and os.path.ismount(ssd_mount):
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                self.storage_path = f"{ssd_mount}/data/{timestamp}"
+            else:
+                # Fallback to SD card
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                self.storage_path = f"/home/pi/PiCameraArray/data/{timestamp}"
+        
+        if self.log_file is None:
+            self.log_file = f"{self.storage_path}/capture.log"
 
 
 # ==================== TIMEOUT EXCEPTION ====================

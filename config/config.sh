@@ -14,3 +14,12 @@ sudo systemctl enable picamera-capture.service
 # Create data directory for captured images
 sudo mkdir -p /home/pi/PiCameraArray/data
 sudo chown -R pi:pi /home/pi/PiCameraArray/data
+
+# Create data directory on SSD (if mounted)
+if [ -d "/media/pi/HIKSEMI" ]; then
+    sudo mkdir -p /media/pi/HIKSEMI/data
+    sudo chown -R pi:pi /media/pi/HIKSEMI/data
+    echo "✓ SSD detected and data directory created"
+else
+    echo "⚠ SSD not detected - will use SD card fallback"
+fi
