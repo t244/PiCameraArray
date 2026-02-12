@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Set libcamera camera timeout to 10 minutes
-sudo sed -i 's/^[[:space:]]*#\?[[:space:]]*camera_timeout_value_ms:[[:space:]]*[0-9]*/camera_timeout_value_ms: 600000/' /usr/share/libcamera/pipeline/rpi/vc4/rpi_apps.yaml
+sudo sed -i 's/^[[:space:]]*#\?[[:space:]]*"camera_timeout_value_ms":[[:space:]]*[0-9]*/"camera_timeout_value_ms": 600000/' /usr/share/libcamera/pipeline/rpi/vc4/rpi_apps.yaml
 
 # Make the startup script executable
 sudo chmod +x /home/pi/PiCameraArray/capture/startup.sh
