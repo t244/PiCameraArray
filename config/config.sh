@@ -16,7 +16,8 @@ sudo mkdir -p /home/pi/PiCameraArray/data
 sudo chown -R pi:pi /home/pi/PiCameraArray/data
 
 # Create data directory on SSD (if mounted)
-if [ -d "/media/pi/HIKSEMI" ]; then
+if mountpoint -q "/media/pi/HIKSEMI"; then
+    # Only proceed if it's actually mounted (not just a leftover directory)
     sudo mkdir -p /media/pi/HIKSEMI/data
     sudo chown -R pi:pi /media/pi/HIKSEMI/data
     echo "✓ SSD detected and data directory created"
