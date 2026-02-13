@@ -106,8 +106,17 @@ venv.bak/
 .DS_Store
 Thumbs.db
 
+＃ Data
+*.png
+*.npz
+*.npy
+
 # Data acquisition logs and captures
 data/
 
 # Data analysis outputs
 collected_data/
+
+# Packed data outputs
+packed_data/
+
