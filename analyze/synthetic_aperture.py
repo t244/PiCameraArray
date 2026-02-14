@@ -157,6 +157,99 @@ class SyntheticApertureProcessor:
         shift_y = offset_y * focal_length_px / focus_depth
         
         return shift_x, shift_y
+
+    def get_relative_RT(self, cam_from: str, cam_to: str):
+        """Return relative rotation R and translation t (meters) mapping X_from -> X_to.
+
+        Looks for key 'cam_from_to_cam_to' in `self.relative_poses`. If only the
+        inverse is present, it inverts the transform.
+        Returns (R, t) or (None, None) if unavailable.
+        """
+        key = f"{cam_from}_to_{cam_to}"
+        if key in self.relative_poses:
+            entry = self.relative_poses[key]
+            R = entry.get('rotation_matrix')
+            t = entry.get('tvec')
+            return R, t
+
+        # try inverse
+        inv_key = f"{cam_to}_to_{cam_from}"
+        if inv_key in self.relative_poses:
+            entry = self.relative_poses[inv_key]
+            R_inv = entry.get('rotation_matrix')
+            t_inv = entry.get('tvec')
+            if R_inv is None or t_inv is None:
+                return None, None
+            R = R_inv.T
+            t = -R @ t_inv
+            return R, t
+
+        return None, None
+
+    def compute_homography_to_center(self, cam_from: str, cam_to: str, depth_mm: float):
+        """Compute homography mapping pixels from cam_from to cam_to for a plane at depth_mm.
+
+        Uses relative transform X_to = R X_from + t (t in meters) and intrinsics K.
+        Assumes plane is fronto-parallel to cam_to (normal [0,0,1]) and depth measured
+        along cam_to z-axis. depth_mm is converted to meters.
+        Returns 3x3 homography or None if insufficient data.
+        """
+        R, t = self.get_relative_RT(cam_from, cam_to)
+        if R is None or t is None:
+            return None
+
+        K_from = self.camera_matrices.get(cam_from)
+        K_to = self.camera_matrices.get(cam_to)
+        if K_from is None or K_to is None:
+            return None
+
+        # plane normal in cam_to frame (frontal)
+        n = np.array([[0.0], [0.0], [1.0]])
+        d = float(depth_mm) / 1000.0  # convert mm to meters
+
+        # Homography: H = K_to * (R - (t * n^T)/d) * K_from^{-1}
+        H = K_to @ (R - (t.reshape(3,1) @ n.T) / d) @ np.linalg.inv(K_from)
+        # Normalize
+        H = H / H[2,2]
+        return H
+
+    def warp_all_to_center(self, focus_depth: float, center_cam: str = None):
+        """Warp all loaded images into the center view using homographies.
+
+        Args:
+            focus_depth: plane depth in mm used to compute homographies
+            center_cam: camera name used as the reference (e.g., 'e05'); if None,
+                        uses the first loaded image as center.
+        Returns:
+            list of warped images (same order as self.images). If homography
+            cannot be computed for a camera, the original image is returned.
+        """
+        if len(self.images) == 0:
+            return []
+
+        if center_cam is None:
+            center_cam = self.image_names[len(self.image_names)//2] if self.image_names else 'e07'
+
+        # output size from center image
+        center_idx = None
+        if center_cam in self.image_names:
+            center_idx = self.image_names.index(center_cam)
+        else:
+            center_idx = len(self.image_names)//2
+
+        h, w = self.images[center_idx].shape[:2]
+        warped = []
+        for idx, img in enumerate(self.images):
+            cam_from = self.image_names[idx]
+            H = self.compute_homography_to_center(cam_from, center_cam, focus_depth)
+            if H is None:
+                # fallback: no homography, use identity
+                warped_img = img
+            else:
+                warped_img = cv2.warpPerspective(img, H, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+            warped.append(warped_img)
+
+        return warped
     
     def shift_image(self, img: np.ndarray, shift_x: float, shift_y: float):
         """Sub-pixel shift using affine transform."""
@@ -211,6 +304,6 @@ if __name__ == "__main__":
     
     # Create a focus sweep to find optimal depth
     for depth in range(200, 1000, 100):
-        img = processor.synthesize(focus_depth=depth, method="mean")
+        img = processor.synthesize(focus_depth=depth, method="trimmed_mean")
         cv2.imwrite(f"focus_{depth}mm.png", img)
         
