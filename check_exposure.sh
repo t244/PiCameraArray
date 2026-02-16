@@ -16,4 +16,4 @@ rpicam-hello -t 0 \
     --gain 1.0 \
     --awbgains 1.0,1.0 \
     --denoise off \
-    --info-text "exposure=%{exp}us gain=%{ag} focus=%{focus}"
+    
