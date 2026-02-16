@@ -9,6 +9,7 @@ import os
 import sys
 from datetime import datetime
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Configuration
 PI_NAMES = [f"e{i:02d}" for i in range(16)]  # e00 to e15
@@ -133,39 +134,40 @@ def get_latest_directory(pi_name, remote_data_dir):
 
 def copy_data_from_pi(pi_name, remote_dir_name, remote_data_dir, local_dir):
     """
-    Copy data directory from a Pi using scp.
-    
+    Copy data directory from a Pi using rsync.
+
     Args:
         pi_name: Name of the Pi (e.g., 'e00')
         remote_dir_name: Name of the remote directory to copy
         remote_data_dir: Path to the data directory on the Pi
         local_dir: Local destination directory
-        
+
     Returns:
         True if successful, False otherwise
     """
     try:
-        remote_path = f"pi@{pi_name}.local:{remote_data_dir}/{remote_dir_name}"
+        remote_path = f"pi@{pi_name}.local:{remote_data_dir}/{remote_dir_name}/"
         local_path = local_dir / f"{pi_name}_{remote_dir_name}"
-        
+        local_path.mkdir(parents=True, exist_ok=True)
+
         print(f"Copying from {pi_name}... ({remote_dir_name})")
-        
+
         cmd = [
             "sshpass",
             "-p",
             "pi",
-            "scp",
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-r",
+            "rsync",
+            "-av",
+            "-e",
+            "ssh -o StrictHostKeyChecking=no",
             remote_path,
-            str(local_path)
+            str(local_path) + "/"
         ]
-        
+
         result = run_command(cmd, check=True)
         print(f"  ✓ Successfully copied to {local_path}")
         return True
-        
+
     except Exception as e:
         print(f"  ✗ Error copying from {pi_name}: {e}")
         return False
@@ -384,60 +386,78 @@ def main():
     
     # Step 3: Retrieve the latest directory name from e00 for all Pis (should be the same)
     # Get latest directory info from e00 to compare with other Pis
-    print(f"Step 3: Copying data from {len(PI_NAMES)} Pis...")
+    MAX_WORKERS = 8
+    print(f"Step 3: Copying data from {len(PI_NAMES)} Pis (up to {MAX_WORKERS} in parallel)...")
     print("-" * 70)
-    
+
     successful = 0
     failed = 0
     skipped = 0
     partial = 0
-    
-    for pi_name in PI_NAMES:
-        local_pi_dir = None
-        
+
+    def process_pi(pi_name):
+        """Process a single Pi: check, sync, or copy. Returns (status, pi_name)."""
         # Determine data directory for this Pi
         pi_remote_dir = get_remote_data_dir(pi_name)
-        
+
         # Check if this Pi's data already exists locally
         if pi_name in already_copied:
+            local_pi_dir = None
             # Find the directory for this Pi
             for item in local_collection_dir.iterdir():
                 if item.is_dir() and item.name.startswith(f"{pi_name}_"):
                     local_pi_dir = item
                     break
-            
+
             if local_pi_dir:
                 # Extract the remote directory name from the local directory
                 remote_dir_name = local_pi_dir.name.split('_', 1)[1]
-                
+
                 # Check if copy is complete
                 is_complete, remote_count, local_count = is_copy_complete(
                     pi_name, remote_dir_name, pi_remote_dir, local_pi_dir
                 )
-                
+
                 if is_complete:
                     print(f"Skipping {pi_name}: All {local_count} PNG files copied ✓")
-                    skipped += 1
+                    return ("skipped", pi_name)
                 else:
                     print(f"Syncing {pi_name}: Remote has {remote_count} files, local has {local_count}")
                     if copy_missing_files_from_pi(pi_name, remote_dir_name, pi_remote_dir, local_pi_dir):
-                        successful += 1
-                        partial += 1
+                        return ("partial", pi_name)
                     else:
-                        failed += 1
-                continue
-        
+                        return ("failed", pi_name)
+
         # Get latest directory for this Pi (first time copy)
         latest_dir = get_latest_directory(pi_name, pi_remote_dir)
-        
+
         if latest_dir:
-            # Copy the data
             if copy_data_from_pi(pi_name, latest_dir, pi_remote_dir, local_collection_dir):
-                successful += 1
+                return ("success", pi_name)
             else:
-                failed += 1
+                return ("failed", pi_name)
         else:
-            failed += 1
+            return ("failed", pi_name)
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(process_pi, pi_name): pi_name for pi_name in PI_NAMES}
+
+        for future in as_completed(futures):
+            pi_name = futures[future]
+            try:
+                status, _ = future.result()
+                if status == "skipped":
+                    skipped += 1
+                elif status == "partial":
+                    successful += 1
+                    partial += 1
+                elif status == "success":
+                    successful += 1
+                else:
+                    failed += 1
+            except Exception as e:
+                print(f"  ✗ Unexpected error for {pi_name}: {e}")
+                failed += 1
     
     # Step 4: Summary
     print("-" * 70)
