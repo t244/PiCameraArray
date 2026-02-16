@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# Stop the capture service to release the camera
+sudo systemctl stop picamera-capture.service
+
 # Switch to internal clock (free-running) mode
 echo 0 > /sys/module/imx296/parameters/trigger_mode
 
