@@ -37,8 +37,8 @@ class CaptureConfig:
     trigger_timeout: float = 600.0
     buffer_count: int = 10
     max_storage_percent: float = 95.0
-    max_temperature: float = 80.0
-    temp_warning: float = 75.0
+    max_temperature: float = 90.0
+    temp_warning: float = 80.0
     check_interval: int = 50
     log_file: str = None
     log_to_console: bool = True
