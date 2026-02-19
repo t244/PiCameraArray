@@ -119,19 +119,117 @@ def pack_by_counter(collected_root: Path, counter_id: str, dataset: Optional[str
     return dest_dir
 
 
+def find_all_counter_ids(dataset_dir: Path) -> list:
+    """Return a sorted list of all unique counter IDs found across camera directories.
+
+    Scans every camera subdirectory (matching e00..e15) and collects the second
+    underscore-separated chunk from each filename stem.
+    """
+    counter_ids: set = set()
+    for cam in PI_NAMES:
+        for p in sorted(dataset_dir.iterdir()):
+            if p.is_dir() and p.name.startswith(cam):
+                for img in p.glob('*.png'):
+                    parts = img.stem.split('_')
+                    if len(parts) >= 2:
+                        counter_ids.add(parts[1])
+                break  # only first matching dir per camera name
+    return sorted(counter_ids)
+
+
+def pack_dataset(dataset_dir: Path, output_root: Optional[Path] = None) -> Path:
+    """Pack every counter ID found in a dataset directory.
+
+    Scans all camera subdirectories in *dataset_dir*, discovers every counter ID
+    present, then calls :func:`pack_by_counter` for each one.
+
+    Args:
+        dataset_dir: Path to a specific dataset directory
+                     (e.g. ``collected_data/20260217_dataset``).
+        output_root: Root for output.  Packed frames go to
+                     ``output_root/<counter_id>/e00..e15.png``.
+                     Defaults to ``./packed_data/<dataset_dir.name>/``.
+
+    Returns:
+        Path to the dataset output directory.
+    """
+    dataset_dir = Path(dataset_dir)
+    if not dataset_dir.exists() or not dataset_dir.is_dir():
+        raise FileNotFoundError(f"Dataset directory not found: {dataset_dir}")
+
+    if output_root is None:
+        output_root = Path.cwd() / 'packed_data' / dataset_dir.name
+    output_root = Path(output_root)
+
+    counter_ids = find_all_counter_ids(dataset_dir)
+    if not counter_ids:
+        raise ValueError(f"No images (counter IDs) found in dataset: {dataset_dir}")
+
+    print(f"Dataset  : {dataset_dir}")
+    print(f"Counters : {len(counter_ids)}  ({counter_ids[0]} .. {counter_ids[-1]})")
+    print(f"Output   : {output_root}\n")
+
+    for counter_id in counter_ids:
+        pack_by_counter(
+            collected_root=dataset_dir.parent,
+            counter_id=counter_id,
+            dataset=dataset_dir.name,
+            output_root=output_root,
+        )
+
+    print(f"\nDone: packed {len(counter_ids)} frames into {output_root}")
+    return output_root
+
+
 def _cli():
-    p = argparse.ArgumentParser(description='Pack images by counter ID into packed_data/<counter_id>/e00..e15.png')
-    p.add_argument('--collected', '-c', required=False, default='collected_data', help='Root collected_data directory (default: collected_data)')
-    p.add_argument('--dataset', '-d', required=False, help='Dataset directory name (if omitted, latest is used)')
-    p.add_argument('--counter', '-k', required=True, type=int, help='Counter ID to pack (integer, will be formatted as %%06d)')
-    p.add_argument('--out', '-o', required=False, default=None, help='Output root for packed data (default: ./packed_data)')
+    p = argparse.ArgumentParser(
+        description='Pack images from a collected_data dataset into packed_data/.',
+        epilog=(
+            'Examples:\n'
+            '  # Pack a single frame:\n'
+            '  python construct/pack_data.py --counter 000123\n\n'
+            '  # Pack every frame in a specific dataset:\n'
+            '  python construct/pack_data.py --dataset 20260217_dataset --all\n\n'
+            '  # Pack every frame in the latest dataset:\n'
+            '  python construct/pack_data.py --all\n'
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument('--collected', '-c', default='collected_data',
+                   help='Root collected_data directory (default: collected_data)')
+    p.add_argument('--dataset', '-d', default=None,
+                   help='Dataset directory name; if omitted, the latest one is used')
+    p.add_argument('--counter', '-k', type=int, default=None,
+                   help='Counter ID to pack (integer, formatted as %%06d); '
+                        'required unless --all is set')
+    p.add_argument('--all', '-a', action='store_true',
+                   help='Pack every counter ID found in the dataset')
+    p.add_argument('--out', '-o', default=None,
+                   help='Output root for packed data '
+                        '(default: ./packed_data  or  ./packed_data/<dataset> with --all)')
 
     args = p.parse_args()
 
+    if not args.all and args.counter is None:
+        p.error('Provide --counter <N> to pack a single frame, or --all to pack the whole dataset.')
+
+    collected_root = Path(args.collected)
+    out_root = Path(args.out) if args.out else None
+
     try:
-        counter_str = f"{args.counter:06d}"
-        out = pack_by_counter(Path(args.collected), counter_str, dataset=args.dataset, output_root=Path(args.out) if args.out else None)
-        print(f"Done: {out}")
+        if args.all:
+            dataset_name = args.dataset or find_latest_dataset(collected_root)
+            if dataset_name is None:
+                print(f"Error: no dataset directories found under {collected_root}")
+                sys.exit(1)
+            dataset_dir = collected_root / dataset_name
+            out = pack_dataset(dataset_dir, output_root=out_root)
+            print(f"Done: {out}")
+        else:
+            counter_str = f"{args.counter:06d}"
+            out = pack_by_counter(collected_root, counter_str,
+                                  dataset=args.dataset, output_root=out_root)
+            print(f"Done: {out}")
     except Exception as e:
         print(f"Error: {e}")
         sys.exit(1)
