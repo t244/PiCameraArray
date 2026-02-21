@@ -112,6 +112,7 @@ Thumbs.db
 *.npz
 *.npy
 *.html
+*.ply
 
 # Data acquisition logs and captures
 data/
