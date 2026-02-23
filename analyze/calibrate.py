@@ -53,11 +53,11 @@ def calibrate_single_camera(image_dir, camera_name):
                 print(f"  {image_file.name}: {len(corners)} markers, {n} charuco corners (skipped, need >= 12)")
 
     # Filter to keep only diverse views by subsampling
-    if len(all_corners) > 30:
-        step = len(all_corners) // 30
-        all_corners = all_corners[::step]
-        all_ids = all_ids[::step]
-        print(f"Subsampled to {len(all_corners)} images for calibration diversity")
+    # if len(all_corners) > 30:
+    #     step = len(all_corners) // 30
+    #     all_corners = all_corners[::step]
+    #     all_ids = all_ids[::step]
+    #     print(f"Subsampled to {len(all_corners)} images for calibration diversity")
 
     if len(all_corners) < 3:
         print(f"Not enough valid calibration images for {camera_name} (found {len(all_corners)}, need at least 3)")
@@ -69,7 +69,7 @@ def calibrate_single_camera(image_dir, camera_name):
     try:
         ret, camera_matrix, dist_coeffs, rvecs, tvecs = cv2.aruco.calibrateCameraCharuco(
             all_corners, all_ids, board, image_size, None, None,
-            flags=cv2.CALIB_FIX_PRINCIPAL_POINT
+            flags=cv2.CALIB_TILTED_MODEL+cv2.CALIB_RATIONAL_MODEL
         )
     except cv2.error as e:
         print(f"Calibration failed for {camera_name}: {e}")
