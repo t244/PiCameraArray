@@ -270,7 +270,7 @@ class SyntheticApertureProcessor:
                 # translation is roughly the last column of H (before normalization) relative to identity
                 shift_x_approx = H[0, 2]
                 shift_y_approx = H[1, 2]
-                print(f"  {cam_from}: shift ≈ ({shift_x_approx:.1f}, {shift_y_approx:.1f}) px")
+                # print(f"  {cam_from}: shift ≈ ({shift_x_approx:.1f}, {shift_y_approx:.1f}) px")
             warped.append(warped_img)
 
             if log_dir is not None:
@@ -350,7 +350,8 @@ if __name__ == "__main__":
     output_dir = Path("outputs")
     output_dir.mkdir(exist_ok=True)
     log_dir = output_dir / "log"
-    for depth in range(300, 1000, 100):
+    for depth in range(1400, 2500, 10):
+        print(f"Processing focus depth: {depth} mm")
         img = processor.synthesize(focus_depth=depth, method="trimmed_mean", log_dir=log_dir)
         cv2.imwrite(str(output_dir / f"focus_{depth}mm.png"), img)
         
