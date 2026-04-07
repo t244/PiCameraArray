@@ -264,13 +264,17 @@ def compute_homography(
 ) -> np.ndarray:
     """Compute plane-induced homography for fronto-parallel plane at depth z.
 
-    H_i(z) = K_ref * (R_rel + t_rel * [0,0,1]^T / z) * K_i^{-1}
+    Maps source camera pixels to reference camera pixels (for warpPerspective).
+    R_rel, t_rel describe the ref→source transform, so we invert to get
+    source→ref: R_i2r = R_rel^T, t_i2r = -R_rel^T @ t_rel.
+
+    H = K_ref @ (R_i2r + t_i2r @ n^T / z) @ K_i^{-1}
 
     Args:
         K_ref: (3, 3) reference camera intrinsics.
         K_i:   (3, 3) source camera intrinsics.
-        R_rel: (3, 3) relative rotation.
-        t_rel: (3,) relative translation (mm).
+        R_rel: (3, 3) relative rotation (ref → source camera).
+        t_rel: (3,) relative translation (ref → source camera, mm).
         z:     Depth of the virtual plane (mm), must be > 0.
 
     Returns:
@@ -280,7 +284,10 @@ def compute_homography(
         raise ValueError(f"Depth z must be > 0, got {z}")
 
     n = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-    H = K_ref @ (R_rel + np.outer(t_rel, n) / z) @ np.linalg.inv(K_i)
+    # Invert relative pose: ref→i  =>  i→ref
+    R_i2r = R_rel.T
+    t_i2r = -R_rel.T @ t_rel
+    H = K_ref @ (R_i2r + np.outer(t_i2r, n) / z) @ np.linalg.inv(K_i)
     return H.astype(np.float64)
 
 
@@ -363,6 +370,541 @@ def batch_warp_threaded(
             warped_list[i], mask_list[i] = fut.result()
 
     return warped_list, mask_list
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Defencing v2 — Dense Defocused Mesh Removal
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def compute_overlap_crop(
+    masks: np.ndarray, margin: int = 10
+) -> tuple:
+    """Rectangular region where ALL views have valid data.
+
+    Args:
+        masks: (N, H, W) float32 validity masks.
+        margin: Shrink crop by this many pixels on each side.
+
+    Returns:
+        (y0, y1, x0, x1) crop coordinates.
+    """
+    all_valid = np.all(masks > 0.5, axis=0)  # (H, W)
+    rows = np.where(all_valid.any(axis=1))[0]
+    cols = np.where(all_valid.any(axis=0))[0]
+    if len(rows) == 0 or len(cols) == 0:
+        H, W = masks.shape[1], masks.shape[2]
+        return (0, H, 0, W)
+    y0, y1 = int(rows[0]) + margin, int(rows[-1]) + 1 - margin
+    x0, x1 = int(cols[0]) + margin, int(cols[-1]) + 1 - margin
+    y0, x0 = max(y0, 0), max(x0, 0)
+    y1 = max(y1, y0 + 1)
+    x1 = max(x1, x0 + 1)
+    return (y0, y1, x0, x1)
+
+
+def _local_sharpness_weight(image: np.ndarray, sigma: float = 3.0) -> np.ndarray:
+    """Per-pixel sharpness as mesh indicator.
+
+    Background is in-focus (high gradient energy), mesh is defocused (smooth).
+    Returns (H, W) float32 in [0, 1].
+    """
+    blurred = cv2.GaussianBlur(image, (0, 0), sigma)
+    lap = cv2.Laplacian(blurred, cv2.CV_32F)
+    energy = lap * lap
+    # Box filter over ~2*sigma window to get local energy density
+    ksize = max(3, int(4 * sigma) | 1)
+    energy = cv2.blur(energy, (ksize, ksize))
+    # Normalize to [0, 1]
+    p99 = np.percentile(energy, 99)
+    if p99 < 1e-10:
+        return np.ones_like(image)
+    w = np.clip(energy / p99, 0.0, 1.0)
+    return w.astype(np.float32)
+
+
+def _cross_view_consistency_weight(
+    warped_images: np.ndarray, masks: np.ndarray,
+    sigma: float = 0.03
+) -> np.ndarray:
+    """Per-view consistency with robust consensus.
+
+    Consensus = trimmed mean of views in percentile [60, 90] to avoid
+    dark-mesh and bright-specular outliers.
+    Returns (N, H, W) float32 in [0, 1].
+    """
+    N, H, W = warped_images.shape
+    masked = warped_images.copy()
+    masked[masks < 0.5] = np.nan
+
+    with np.errstate(all='ignore'):
+        p60 = np.nanpercentile(masked, 60, axis=0)
+        p90 = np.nanpercentile(masked, 90, axis=0)
+    # Trimmed mean: mean of values in [p60, p90]
+    acc = np.zeros((H, W), dtype=np.float64)
+    cnt = np.zeros((H, W), dtype=np.float64)
+    for i in range(N):
+        valid = (masks[i] > 0.5)
+        in_range = valid & (warped_images[i] >= p60) & (warped_images[i] <= p90)
+        acc += np.where(in_range, warped_images[i], 0.0)
+        cnt += in_range.astype(np.float64)
+    consensus = np.where(cnt > 0, acc / cnt, np.nanmedian(masked, axis=0))
+    consensus = np.nan_to_num(consensus, nan=0.0).astype(np.float32)
+
+    weights = np.zeros_like(warped_images)
+    for i in range(N):
+        diff = warped_images[i] - consensus
+        w = np.exp(-0.5 * (diff / sigma) ** 2)
+        w[masks[i] < 0.5] = 0.0
+        weights[i] = w.astype(np.float32)
+    return weights
+
+
+def _percentile_deviation_weight(
+    warped_images: np.ndarray, masks: np.ndarray,
+    high_pct: float = 95.0
+) -> np.ndarray:
+    """Deviation from the 'clean ceiling' brightness estimate.
+
+    Views below the ceiling are mesh-attenuated; views above are specular.
+    Returns (N, H, W) float32 in [0, 1].
+    """
+    N = warped_images.shape[0]
+    masked = warped_images.copy()
+    masked[masks < 0.5] = np.nan
+    with np.errstate(all='ignore'):
+        ceiling = np.nanpercentile(masked, high_pct, axis=0).astype(np.float32)
+    ceiling = np.nan_to_num(ceiling, nan=1.0)
+    ceiling = np.maximum(ceiling, 1e-6)
+
+    weights = np.zeros_like(warped_images)
+    for i in range(N):
+        ratio = warped_images[i] / ceiling
+        # Dark mesh: penalize quadratically
+        w_dark = np.clip(ratio, 0.0, 1.0) ** 2
+        # Specular bright: also penalize
+        w_spec = np.where(ratio > 1.05, np.clip(2.0 - ratio, 0.0, 1.0), 1.0)
+        w = w_dark * w_spec
+        w[masks[i] < 0.5] = 0.0
+        weights[i] = w.astype(np.float32)
+    return weights
+
+
+def estimate_mesh_weights(
+    warped_images: np.ndarray, masks: np.ndarray,
+    sharpness_sigma: float = 3.0,
+    consistency_sigma: float = 0.03,
+    percentile_ref: float = 95.0,
+    smooth_sigma: float = 5.0
+) -> np.ndarray:
+    """Per-view, per-pixel mesh detection weights.
+
+    Combines three cues:
+      1. Local sharpness (background in-focus vs mesh defocused)
+      2. Cross-view consistency (mesh shifts between views)
+      3. Percentile deviation (mesh attenuates or reflects)
+
+    Args:
+        warped_images: (N, H, W) float32 aligned views.
+        masks:         (N, H, W) float32 validity masks.
+        sharpness_sigma: Gaussian scale for sharpness measurement.
+        consistency_sigma: Bandwidth for consistency weighting.
+        percentile_ref: Reference percentile for ceiling estimate.
+        smooth_sigma: Final smoothing of weight maps.
+
+    Returns:
+        (N, H, W) float32 weights in [0, 1].
+    """
+    N = warped_images.shape[0]
+
+    # Cue 1: per-view sharpness
+    sharpness = np.zeros_like(warped_images)
+    for i in range(N):
+        sharpness[i] = _local_sharpness_weight(warped_images[i], sharpness_sigma)
+
+    # Cue 2: cross-view consistency
+    consistency = _cross_view_consistency_weight(
+        warped_images, masks, consistency_sigma
+    )
+
+    # Cue 3: percentile deviation
+    pct_dev = _percentile_deviation_weight(
+        warped_images, masks, percentile_ref
+    )
+
+    # Combine: product of three cues
+    weights = sharpness * consistency * pct_dev
+
+    # Smooth to avoid hard edges
+    if smooth_sigma > 0:
+        for i in range(N):
+            weights[i] = cv2.GaussianBlur(weights[i], (0, 0), smooth_sigma)
+
+    # Ensure at least one view has nonzero weight per pixel
+    wsum = weights.sum(axis=0)
+    dead = wsum < 1e-8
+    if dead.any():
+        for i in range(N):
+            weights[i][dead] = masks[i][dead]
+
+    return weights.astype(np.float32)
+
+
+def _refine_tile_depth(
+    ref_tile: np.ndarray,
+    warped_tiles: np.ndarray,
+    weight_tiles: np.ndarray,
+    mask_tiles: np.ndarray,
+    depth_candidates: np.ndarray,
+    K_ref: np.ndarray, K_all: np.ndarray,
+    R_rel: np.ndarray, t_rel: np.ndarray,
+    ref_idx: int,
+    tile_origin: tuple,
+    base_depth: float
+) -> float:
+    """Find the depth that minimizes weighted alignment error for a tile.
+
+    Tests multiple depth candidates and returns the best one.
+    """
+    N = warped_tiles.shape[0]
+    th, tw = ref_tile.shape
+    best_depth = base_depth
+    best_cost = np.inf
+
+    # Reference tile pixels
+    ref_valid = ref_tile.copy()
+
+    for z in depth_candidates:
+        if abs(z - base_depth) < 0.1:
+            # No correction needed at base depth
+            cost = 0.0
+            total_w = 0.0
+            for i in range(N):
+                if i == ref_idx:
+                    continue
+                w = weight_tiles[i] * mask_tiles[i]
+                diff = np.abs(warped_tiles[i] - ref_valid)
+                cost += (w * diff).sum()
+                total_w += w.sum()
+            if total_w > 0:
+                cost /= total_w
+        else:
+            # Compute differential shift for this depth
+            cost = 0.0
+            total_w = 0.0
+            for i in range(N):
+                if i == ref_idx:
+                    continue
+                w = weight_tiles[i] * mask_tiles[i]
+                if w.sum() < 1e-6:
+                    continue
+                # Compute homography correction: warp from base_depth to z
+                H_base = compute_homography(
+                    K_ref, K_all[i], R_rel[i], t_rel[i], base_depth
+                )
+                H_new = compute_homography(
+                    K_ref, K_all[i], R_rel[i], t_rel[i], z
+                )
+                # Differential: H_new @ H_base^{-1}
+                H_diff = H_new @ np.linalg.inv(H_base)
+                # Apply only the translation part (small correction)
+                # For a small tile, this is approximately a shift
+                dx = H_diff[0, 2] / H_diff[2, 2]
+                dy = H_diff[1, 2] / H_diff[2, 2]
+                # Shift the warped tile
+                M = np.float32([[1, 0, dx], [0, 1, dy]])
+                shifted = cv2.warpAffine(
+                    warped_tiles[i], M, (tw, th),
+                    flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_CONSTANT, borderValue=0.0
+                )
+                diff = np.abs(shifted - ref_valid)
+                cost += (w * diff).sum()
+                total_w += w.sum()
+            if total_w > 0:
+                cost /= total_w
+
+        if cost < best_cost:
+            best_cost = cost
+            best_depth = z
+
+    return best_depth
+
+
+def reconstruct_background_tiled(
+    warped_images: np.ndarray, masks: np.ndarray,
+    weights: np.ndarray,
+    K: np.ndarray, R_rel: np.ndarray, t_rel: np.ndarray,
+    focus_depth: float, ref_idx: int = 0,
+    tile_size: int = 128, tile_overlap: int = 32,
+    depth_range: float = 100.0, depth_steps: int = 11
+) -> np.ndarray:
+    """Tile-based background reconstruction with local depth refinement.
+
+    Divides the image into overlapping tiles. For each tile:
+    1. Search local depth to find best alignment
+    2. Apply depth-corrected shifts
+    3. Weighted composite favoring clean views
+
+    Tiles are blended with Hann windows.
+
+    Returns:
+        (H, W) float32 reconstructed background.
+    """
+    N, H, W = warped_images.shape
+    stride = tile_size - tile_overlap
+
+    # Depth candidates
+    if depth_steps > 1:
+        depths = np.linspace(
+            focus_depth - depth_range,
+            focus_depth + depth_range,
+            depth_steps
+        )
+        depths = np.maximum(depths, 10.0)
+    else:
+        depths = np.array([focus_depth])
+
+    # Hann blending window
+    hann_1d = np.hanning(tile_size).astype(np.float32)
+    hann_2d = np.outer(hann_1d, hann_1d)
+
+    output = np.zeros((H, W), dtype=np.float64)
+    wbuf = np.zeros((H, W), dtype=np.float64)
+
+    K_ref = K[ref_idx]
+    n_tiles = 0
+
+    for y0 in range(0, H, stride):
+        for x0 in range(0, W, stride):
+            y1 = min(y0 + tile_size, H)
+            x1 = min(x0 + tile_size, W)
+            th, tw = y1 - y0, x1 - x0
+
+            # Extract tiles
+            ref_tile = warped_images[ref_idx, y0:y1, x0:x1]
+            w_tiles = weights[:, y0:y1, x0:x1]
+            m_tiles = masks[:, y0:y1, x0:x1]
+            v_tiles = warped_images[:, y0:y1, x0:x1]
+
+            # Local depth search
+            best_z = _refine_tile_depth(
+                ref_tile, v_tiles, w_tiles, m_tiles,
+                depths, K_ref, K, R_rel, t_rel,
+                ref_idx, (y0, x0), focus_depth
+            )
+
+            # Apply depth correction and composite
+            tile_result = np.zeros((th, tw), dtype=np.float64)
+            tile_wsum = np.zeros((th, tw), dtype=np.float64)
+
+            for i in range(N):
+                w = (w_tiles[i] * m_tiles[i]).astype(np.float64)
+                w = w ** 2  # Squared weights sharpen selection
+                if w.sum() < 1e-8:
+                    continue
+
+                if i == ref_idx or abs(best_z - focus_depth) < 0.1:
+                    tile_val = v_tiles[i].astype(np.float64)
+                else:
+                    # Shift for depth correction
+                    H_base = compute_homography(
+                        K_ref, K[i], R_rel[i], t_rel[i], focus_depth
+                    )
+                    H_new = compute_homography(
+                        K_ref, K[i], R_rel[i], t_rel[i], best_z
+                    )
+                    H_diff = H_new @ np.linalg.inv(H_base)
+                    dx = H_diff[0, 2] / H_diff[2, 2]
+                    dy = H_diff[1, 2] / H_diff[2, 2]
+                    M = np.float32([[1, 0, dx], [0, 1, dy]])
+                    tile_val = cv2.warpAffine(
+                        v_tiles[i], M, (tw, th),
+                        flags=cv2.INTER_LINEAR,
+                        borderMode=cv2.BORDER_CONSTANT, borderValue=0.0
+                    ).astype(np.float64)
+
+                tile_result += w * tile_val
+                tile_wsum += w
+
+            # Normalize
+            safe = tile_wsum > 1e-8
+            tile_out = np.where(safe, tile_result / tile_wsum, ref_tile)
+
+            # Hann blending
+            win = hann_2d[:th, :tw].astype(np.float64)
+            output[y0:y1, x0:x1] += tile_out * win
+            wbuf[y0:y1, x0:x1] += win
+            n_tiles += 1
+
+    # Normalize accumulated tiles
+    safe = wbuf > 1e-8
+    with np.errstate(invalid='ignore', divide='ignore'):
+        result = np.where(safe, output / wbuf, warped_images[ref_idx])
+    return np.clip(result, 0.0, 1.0).astype(np.float32)
+
+
+def global_brightness_correction(
+    result: np.ndarray,
+    warped_images: np.ndarray, weights: np.ndarray,
+    masks: np.ndarray,
+    correction_sigma: float = 50.0,
+    max_boost: float = 1.25
+) -> np.ndarray:
+    """Correct residual mesh attenuation via low-frequency flat-field.
+
+    Compares the result to the theoretical clean ceiling and applies
+    a smooth brightness correction.
+    """
+    masked = warped_images.copy()
+    masked[masks < 0.5] = np.nan
+    with np.errstate(all='ignore'):
+        ceiling = np.nanpercentile(masked, 99, axis=0).astype(np.float32)
+    ceiling = np.nan_to_num(ceiling, nan=0.0)
+
+    ceil_blur = cv2.GaussianBlur(ceiling, (0, 0), correction_sigma)
+    res_blur = cv2.GaussianBlur(result, (0, 0), correction_sigma)
+
+    ratio = np.where(res_blur > 0.01, ceil_blur / res_blur, 1.0)
+    ratio = np.clip(ratio, 1.0, max_boost).astype(np.float32)
+
+    corrected = result * ratio
+    return np.clip(corrected, 0.0, 1.0).astype(np.float32)
+
+
+def _v2_cache_path(output_dir: Path, focus_depth: float, ref_idx: int) -> Path:
+    """Cache file path for warped images, masks, crop, and weights."""
+    return output_dir / f"_v2_cache_d{focus_depth:.0f}_ref{ref_idx}.npz"
+
+
+def run_defencing_v2(
+    images: np.ndarray, K: np.ndarray, dist: np.ndarray,
+    R_rel: np.ndarray, t_rel: np.ndarray,
+    focus_depth: float = 750.0, ref_idx: int = 0,
+    tile_size: int = 128, tile_overlap: int = 32,
+    depth_range: float = 100.0, depth_steps: int = 11,
+    sharpness_sigma: float = 3.0,
+    consistency_sigma: float = 0.03,
+    percentile_ref: float = 95.0,
+    smooth_sigma: float = 5.0,
+    brightness_correction: bool = True,
+    max_boost: float = 1.25,
+    warp_threads: int = 4,
+    save_intermediates: bool = False,
+    output_dir: Path = None
+) -> np.ndarray:
+    """Advanced defencing pipeline for dense defocused mesh removal.
+
+    Designed for the case where a defocused metallic mesh covers the entire
+    image. The mesh is specular (bright or dark) and out-of-focus, while the
+    background is in-focus with fine texture.
+
+    Pipeline:
+      1. Undistort images
+      2. Warp all views to reference at focus_depth
+      3. Crop to overlap region
+      4. Estimate per-view mesh weights (3-cue system)
+      5. Tile-based reconstruction with local depth refinement
+      6. Brightness correction for residual attenuation
+
+    Steps 1-4 are cached to ``output_dir/_v2_cache_d{depth}_ref{idx}.npz``.
+    When the cache exists and ``focus_depth`` / ``ref_idx`` match, those steps
+    are skipped and the cached warped images, masks, crop, and weights are
+    loaded directly.  This lets you iterate on step 5-6 parameters (tile size,
+    depth search, brightness correction) without re-computing steps 1-4.
+
+    Returns:
+        (H, W) float32 deoccluded image in [0, 1].
+    """
+    N, H, W = images.shape
+    output_size = (W, H)
+
+    cache_file = None
+    if output_dir is not None:
+        cache_file = _v2_cache_path(output_dir, focus_depth, ref_idx)
+
+    # Try loading cache
+    if cache_file is not None and cache_file.exists():
+        print(f"  [1-4] Loading cache: {cache_file.name}")
+        cache = np.load(str(cache_file))
+        warped_c = cache["warped"]
+        masks_c = cache["masks"]
+        w = cache["weights"]
+        crop = cache["crop"]
+        y0, y1, x0, x1 = int(crop[0]), int(crop[1]), int(crop[2]), int(crop[3])
+        print(f"    Crop: ({y0},{x0}) to ({y1},{x1}) = {x1-x0}x{y1-y0}")
+    else:
+        # Step 1: Undistort
+        print("  [1/6] Undistorting...")
+        images = undistort_images(images, K, dist)
+
+        # Step 2: Warp all views
+        print(f"  [2/6] Warping {N} views to depth {focus_depth:.0f} mm...")
+        H_all = compute_all_homographies(K, R_rel, t_rel, focus_depth, ref_idx)
+        warped = np.zeros((N, H, W), dtype=np.float32)
+        masks = np.zeros((N, H, W), dtype=np.float32)
+        for i in range(N):
+            if i == ref_idx:
+                warped[i] = images[i]
+                masks[i] = 1.0
+            else:
+                warped[i] = warp_image(images[i], H_all[i], output_size)
+                masks[i] = compute_validity_mask(
+                    H_all[i], images[i].shape, output_size
+                )
+
+        # Step 3: Crop to overlap
+        print("  [3/6] Cropping to overlap region...")
+        y0, y1, x0, x1 = compute_overlap_crop(masks, margin=10)
+        warped_c = warped[:, y0:y1, x0:x1].copy()
+        masks_c = masks[:, y0:y1, x0:x1].copy()
+        print(f"    Crop: ({y0},{x0}) to ({y1},{x1}) = {x1-x0}x{y1-y0}")
+
+        # Step 4: Mesh weight estimation
+        print("  [4/6] Estimating mesh weights...")
+        w = estimate_mesh_weights(
+            warped_c, masks_c,
+            sharpness_sigma=sharpness_sigma,
+            consistency_sigma=consistency_sigma,
+            percentile_ref=percentile_ref,
+            smooth_sigma=smooth_sigma
+        )
+
+        # Save cache
+        if cache_file is not None:
+            np.savez_compressed(
+                str(cache_file),
+                warped=warped_c, masks=masks_c, weights=w,
+                crop=np.array([y0, y1, x0, x1])
+            )
+            print(f"    Saved cache: {cache_file.name}")
+
+    if save_intermediates and output_dir is not None:
+        w_vis = (w[ref_idx] / (w[ref_idx].max() + 1e-8) * 255).astype(np.uint8)
+        cv2.imwrite(str(output_dir / "mesh_weights_ref.png"), w_vis)
+        w_mean = w.mean(axis=0)
+        w_mean_vis = (w_mean / (w_mean.max() + 1e-8) * 255).astype(np.uint8)
+        cv2.imwrite(str(output_dir / "mesh_weights_mean.png"), w_mean_vis)
+
+    # Step 5: Tiled reconstruction
+    print("  [5/6] Tiled reconstruction...")
+    result = reconstruct_background_tiled(
+        warped_c, masks_c, w,
+        K, R_rel, t_rel,
+        focus_depth, ref_idx,
+        tile_size=tile_size, tile_overlap=tile_overlap,
+        depth_range=depth_range, depth_steps=depth_steps
+    )
+
+    # Step 6: Brightness correction
+    if brightness_correction:
+        print("  [6/6] Brightness correction...")
+        result = global_brightness_correction(
+            result, warped_c, w, masks_c, max_boost=max_boost
+        )
+    else:
+        print("  [6/6] Brightness correction skipped.")
+
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2116,22 +2658,22 @@ def parse_args():
                         help="Output directory (default: <image_dir>/mpi_sar_output)")
 
     # Method selection
-    parser.add_argument("--method", default="mpi",
+    parser.add_argument("--method", default="defencing_v2",
                         choices=["mpi", "median", "trimmed_mean", "mean",
-                                 "defencing"],
-                        help="Processing method (default: mpi)")
+                                 "defencing", "defencing_v2"],
+                        help="Processing method (default: defencing_v2)")
 
     # Depth range
-    parser.add_argument("--z-near", type=float, default=50.0,
-                        help="Nearest depth plane in mm (default: 50)")
-    parser.add_argument("--z-far", type=float, default=700.0,
-                        help="Farthest depth plane in mm (default: 700)")
+    parser.add_argument("--z-near", type=float, default=100.0,
+                        help="Nearest depth plane in mm (default: 100)")
+    parser.add_argument("--z-far", type=float, default=1000.0,
+                        help="Farthest depth plane in mm (default: 1000)")
     parser.add_argument("--n-planes", type=int, default=64,
                         help="Number of depth planes (default: 64)")
 
     # Focus depth for classical methods
-    parser.add_argument("--focus-depth", type=float, default=500.0,
-                        help="Focus depth in mm for median/trimmed_mean (default: 500)")
+    parser.add_argument("--focus-depth", type=float, default=750.0,
+                        help="Focus depth in mm for median/trimmed_mean (default: 750)")
 
     # Cost volume parameters
     parser.add_argument("--scale", type=float, default=0.25,
@@ -2209,6 +2751,24 @@ def parse_args():
     parser.add_argument("--undistort", action="store_true",
                         help="Undistort images before processing")
 
+    # Defencing v2 parameters
+    parser.add_argument("--tile-size", type=int, default=128,
+                        help="Tile size for v2 tiled reconstruction")
+    parser.add_argument("--tile-overlap", type=int, default=32,
+                        help="Tile overlap for v2 tiled reconstruction")
+    parser.add_argument("--depth-search-range", type=float, default=100.0,
+                        help="Depth search range +/- mm around focus-depth")
+    parser.add_argument("--depth-search-steps", type=int, default=11,
+                        help="Number of depth hypotheses for local search")
+    parser.add_argument("--brightness-correction", action="store_true",
+                        default=True,
+                        help="Apply brightness correction (default: on)")
+    parser.add_argument("--no-brightness-correction",
+                        action="store_false", dest="brightness_correction",
+                        help="Disable brightness correction")
+    parser.add_argument("--max-boost", type=float, default=1.25,
+                        help="Maximum brightness boost factor")
+
     return parser.parse_args()
 
 
@@ -2258,8 +2818,8 @@ def main():
     print(f"  {n_cameras} images, shape {images.shape[1:]}  "
           f"ref=e{cam_indices[ref_local]:02d} (local idx {ref_local})")
 
-    # Optional undistortion
-    if args.undistort:
+    # Optional undistortion (v2 undistorts internally)
+    if args.undistort and args.method != "defencing_v2":
         print("  Undistorting...")
         images = undistort_images(images, K, dist)
 
@@ -2287,6 +2847,22 @@ def main():
             warp_threads=args.warp_threads,
             save_depth=args.save_depth, output_dir=output_dir,
             z_near=args.z_near, z_far=args.z_far
+        )
+    elif args.method == "defencing_v2":
+        print("[Step 3] Running de-fencing v2 pipeline...")
+        result = run_defencing_v2(
+            images, K, dist, R_rel, t_rel,
+            focus_depth=args.focus_depth,
+            ref_idx=ref_local,
+            tile_size=args.tile_size,
+            tile_overlap=args.tile_overlap,
+            depth_range=args.depth_search_range,
+            depth_steps=args.depth_search_steps,
+            brightness_correction=args.brightness_correction,
+            max_boost=args.max_boost,
+            warp_threads=args.warp_threads,
+            save_intermediates=args.save_masks,
+            output_dir=output_dir
         )
     elif args.method == "defencing":
         print("[Step 3] Running de-fencing pipeline...")
