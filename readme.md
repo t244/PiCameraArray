@@ -47,13 +47,28 @@ on-site focusing and exposure adjustment.
 | `/mode` | POST | `{"mode": "preview"\|"capture"}` |
 | `/stream.mjpg` | GET | MJPEG stream (preview only) |
 | `/controls` | POST | `{"exposure_us": int, "gain": float}` (preview only) |
+| `/last.jpg` | GET | thumbnail of last captured frame (capture mode) |
 | `/trigger/exposure` | POST | `{"exposure_us": int}` → Arduino `E` (master only) |
 | `/trigger/period` | POST | `{"period_ms": int}` → Arduino `T` (master only) |
+| `/trigger/fps` | POST | `{"fps": int}` → Arduino `F` (master only) |
+| `/trigger/burst` | POST | `{"burst_ms": int}` → Arduino `B` (master only) |
 | `/trigger/start` `/trigger/stop` | POST | Arduino `S` / `P` (master only) |
 | `/trigger/status` | GET | Arduino `R` (master only) |
 
 Note: in IMX296 trigger mode the exposure time equals the trigger pulse
 width, so the exposure is a single global value for the whole array.
+
+### Burst capture (video analysis)
+
+The Arduino fires a pulse train every period: `fps` (default 30) pulses/s
+for `burst` (default 3 s) → 90 hardware-synchronized frames per burst.
+Each Pi buffers the frames in RAM and writes one npz file per burst
+(`<host>_burstNNNN_<timestamp>.npz`, keys `frames` (N,1088,1456) uint8 and
+`timestamps`) during the idle time between bursts.
+
+Constraints: exposure < 1/fps (e.g. <33 ms at 30 fps, <15 ms at 60 fps);
+max 450 frames/burst (RAM); storage ≈ 1.58 MB × fps × burst_s per burst
+per camera (256 GB SSD ≈ 28 h at defaults: 30 fps × 3 s / 60 s period).
 
 ## Documentation
 

@@ -92,7 +92,11 @@
 
   <div class="ctl">
     <label>周期 (s)</label>
-    <input type="number" id="periodNum" value="30" min="0.5" max="3600" step="0.5" style="width:70px">
+    <input type="number" id="periodNum" value="60" min="1" max="3600" step="1" style="width:60px">
+    <label>FPS</label>
+    <input type="number" id="fpsNum" value="30" min="1" max="60" step="1" style="width:50px">
+    <label>バースト (s)</label>
+    <input type="number" id="burstNum" value="3" min="0.1" max="15" step="0.1" style="width:55px">
     <button onclick="writeArduino()">Arduinoへ書込み</button>
     <button class="green" onclick="triggerCmd('start')">トリガ開始</button>
     <button class="red" onclick="triggerCmd('stop')">トリガ停止</button>
@@ -220,14 +224,34 @@ async function writeArduino() {
   if (!masterHost) { logMsg("エラー: Arduino接続ホストが見つかりません"); return; }
   const exposure_us = exposureUs();
   const period_ms = Math.round(parseFloat($("periodNum").value) * 1000);
-  if (exposure_us / 1000 >= period_ms) {
-    logMsg("エラー: 露光時間はトリガ周期より短くしてください"); return;
+  const fps = parseInt($("fpsNum").value);
+  const burst_ms = Math.round(parseFloat($("burstNum").value) * 1000);
+
+  // Validation
+  const frameInterval_us = 1e6 / fps;
+  if (exposure_us + 500 > frameInterval_us) {
+    logMsg(`エラー: 露光${exposure_us / 1000}msは${fps}fpsのフレーム間隔` +
+           `(${(frameInterval_us / 1000).toFixed(1)}ms)に収まりません`); return;
   }
+  if (burst_ms >= period_ms) {
+    logMsg("エラー: バースト時間は周期より短くしてください"); return;
+  }
+  const nFrames = Math.floor(burst_ms * fps / 1000);
+  if (nFrames > 450) {
+    logMsg(`エラー: ${nFrames}枚/バーストはPiのRAMバッファ上限(450枚)を超えます`); return;
+  }
+
   try {
-    const r1 = await api(masterHost, "/trigger/exposure", "POST", { exposure_us });
-    logMsg(`Arduino 露光 (${masterHost}): ${r1.response || JSON.stringify(r1)}`);
-    const r2 = await api(masterHost, "/trigger/period", "POST", { period_ms });
-    logMsg(`Arduino 周期 (${masterHost}): ${r2.response || JSON.stringify(r2)}`);
+    for (const [path, body, label] of [
+      ["/trigger/exposure", { exposure_us }, "露光"],
+      ["/trigger/period", { period_ms }, "周期"],
+      ["/trigger/fps", { fps }, "FPS"],
+      ["/trigger/burst", { burst_ms }, "バースト"],
+    ]) {
+      const r = await api(masterHost, path, "POST", body);
+      logMsg(`Arduino ${label}: ${r.response || JSON.stringify(r)}`);
+    }
+    logMsg(`設定完了: ${nFrames}枚/バースト × 周期${period_ms / 1000}s`);
   } catch (e) { logMsg(`Arduino書込み失敗: ${e}`); }
 }
 
@@ -277,8 +301,8 @@ async function poll() {
       badge.textContent = s.mode || "?";
       badge.className = `badge ${s.mode || "offline"}`;
       if (s.mode === "preview") attachStream(i);
-      else if (s.mode === "capture" && s.capture_count > 0)
-        showLastCapture(i, s.capture_count);
+      else if (s.mode === "capture" && s.burst_count > 0)
+        showLastCapture(i, s.burst_count);  // thumbnail updates per burst
       else detachStream(i);
       const t = s.cpu_temp != null ? `${s.cpu_temp.toFixed(0)}°C` : "";
       const st = s.storage_usage != null ? `${s.storage_usage}%` : "";
@@ -286,8 +310,10 @@ async function poll() {
         ? `${(s.actual_exposure_us / 1000).toFixed(1)}ms` : "";
       const lastT = s.last_capture_time
         ? s.last_capture_time.split("T")[1] : "";
+      const buf = s.buffering > 0 ? `[+${s.buffering}]` : "";
       meta.textContent = s.mode === "capture"
-        ? `#${s.capture_count} ${lastT} ${t} ${st}` : `${exp} ${t}`;
+        ? `${s.burst_count}b/${s.capture_count}f${buf} ${lastT} ${t} ${st}`
+        : `${exp} ${t}`;
       focus.textContent = (s.mode === "preview" && s.focus != null)
         ? `F:${s.focus.toFixed(0)}` : "";
       if (s.has_arduino) foundMaster = hosts[i];

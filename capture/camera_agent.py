@@ -38,6 +38,7 @@ import time
 import signal
 import logging
 import threading
+import queue
 import concurrent.futures
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -74,6 +75,12 @@ SD_FALLBACK = "/home/pi/PiCameraArray/data"
 
 CAPTURE_WAIT_CHUNK = 1.0     # polling slice; mode-switch latency upper bound
 TRIGGER_TIMEOUT = 600.0      # warn if no trigger for this long
+
+# Burst buffering: frames are accumulated in RAM during a trigger burst
+# and flushed to disk (npz) in the idle time between bursts.
+BURST_GAP_S = 0.8            # no frame for this long = burst has ended
+MAX_BURST_FRAMES = 450       # RAM safety cap (~710 MB at 8bit full res)
+CAPTURE_BUFFER_COUNT = 16    # camera driver buffers for burst capture
 MAX_STORAGE_PERCENT = 95.0
 MAX_TEMPERATURE = 90.0
 TEMP_WARNING = 80.0
@@ -236,6 +243,14 @@ class CameraManager:
         self.last_jpeg = None            # thumbnail of last captured frame
         self.last_capture_time = None
 
+        # burst buffering
+        self.burst_count = 0
+        self._burst_frames = []
+        self._burst_times = []
+        self._last_frame_mono = 0.0
+        self._writer_queue = queue.Queue()
+        threading.Thread(target=self._writer_loop, daemon=True).start()
+
         # preview state
         self.exposure_us = DEFAULT_EXPOSURE_US
         self.gain = DEFAULT_GAIN
@@ -252,6 +267,8 @@ class CameraManager:
             self.desired_mode = mode
 
     def _close_camera(self):
+        if self._burst_frames:
+            self._flush_burst()  # don't lose a partial burst on mode switch
         self._pending_job = None
         self._focus_stop.set()
         if self._focus_thread is not None:
@@ -284,11 +301,16 @@ class CameraManager:
         set_trigger_mode(True)
         self.session_dir = make_session_dir()
         self.capture_count = 0
+        self.burst_count = 0
+        self._burst_frames = []
+        self._burst_times = []
         self.no_trigger_elapsed = 0.0
         self.picam2 = Picamera2()
-        config = self.picam2.create_still_configuration(
-            main={"size": (IMAGE_WIDTH, IMAGE_HEIGHT)},
-            buffer_count=10,
+        # Video configuration: YUV420 so the 8-bit Y plane can be grabbed
+        # cheaply at burst rates (the IMX296 used here is monochrome)
+        config = self.picam2.create_video_configuration(
+            main={"size": (IMAGE_WIDTH, IMAGE_HEIGHT), "format": "YUV420"},
+            buffer_count=CAPTURE_BUFFER_COUNT,
         )
         self.picam2.configure(config)
         self.picam2.start()
@@ -353,12 +375,11 @@ class CameraManager:
     # ----- capture loop (async job + polling; signal-free) -----
 
     def capture_one(self):
-        """Poll for a triggered frame in CAPTURE_WAIT_CHUNK slices.
+        """Poll for triggered frames in CAPTURE_WAIT_CHUNK slices.
 
-        capture_request(wait=False) dispatches a job; get_result(timeout=...)
-        raises TimeoutError on expiry WITHOUT cancelling the job, so we can
-        return to the main loop (mode switching stays responsive) and keep
-        waiting on the same job next iteration.
+        Frames arriving in a burst are appended to an in-RAM buffer; when
+        no frame arrives for BURST_GAP_S the burst is considered finished
+        and the buffer is queued for writing (npz) by the writer thread.
         """
         try:
             if self._pending_job is None:
@@ -366,7 +387,10 @@ class CameraManager:
             request = self._pending_job.get_result(timeout=CAPTURE_WAIT_CHUNK)
             self._pending_job = None
         except (TimeoutError, concurrent.futures.TimeoutError):
-            # No trigger within this chunk; job stays pending.
+            # No frame in this slice: flush if a burst just ended
+            if self._burst_frames and (
+                    time.monotonic() - self._last_frame_mono > BURST_GAP_S):
+                self._flush_burst()
             self.no_trigger_elapsed += CAPTURE_WAIT_CHUNK
             if self.no_trigger_elapsed >= TRIGGER_TIMEOUT:
                 log.warning(f"No trigger received in {TRIGGER_TIMEOUT:.0f}s")
@@ -380,32 +404,67 @@ class CameraManager:
 
         try:
             self.no_trigger_elapsed = 0.0
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-            filename = f"{self.hostname}_{self.capture_count:06d}_{ts}.{IMAGE_FORMAT}"
-            filepath = os.path.join(self.session_dir, filename)
-            request.save("main", filepath)
-            self._update_thumbnail(request)
+            arr = request.make_array("main")
             request.release()
+            # YUV420 array is (H*3/2, W); the Y plane is the first H rows
+            y = np.ascontiguousarray(arr[:IMAGE_HEIGHT, :IMAGE_WIDTH])
+            self._burst_frames.append(y)
+            self._burst_times.append(
+                datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3])
+            self._last_frame_mono = time.monotonic()
             self.capture_count += 1
-            self.last_capture_time = datetime.now().isoformat(timespec="seconds")
-            log.info(f"Captured: {filename}")
+            self.last_capture_time = datetime.now().isoformat(
+                timespec="seconds")
 
-            if self.capture_count % HEALTH_CHECK_INTERVAL == 0:
-                self._health_check()
+            if len(self._burst_frames) >= MAX_BURST_FRAMES:
+                log.warning("Burst buffer full - flushing early")
+                self._flush_burst()
         except Exception as e:
-            log.error(f"Save failed: {e}")
+            log.error(f"Frame handling failed: {e}")
 
-    def _update_thumbnail(self, request):
-        """Store a half-resolution JPEG of the captured frame for /last.jpg."""
+    def _flush_burst(self):
+        """Move the RAM buffer to the writer queue as one npz file."""
+        if not self._burst_frames:
+            return
+        frames = np.stack(self._burst_frames)
+        times = np.array(self._burst_times)
+        self._burst_frames = []
+        self._burst_times = []
+        self.burst_count += 1
+
+        fname = (f"{self.hostname}_burst{self.burst_count:04d}"
+                 f"_{times[0]}.npz")
+        path = os.path.join(self.session_dir, fname)
+        self._writer_queue.put((path, frames, times))
+        log.info(f"Burst {self.burst_count}: {len(times)} frames "
+                 f"({frames.nbytes / 1e6:.0f} MB) queued -> {fname}")
+
+        self._update_thumbnail(frames[-1])
+        self._health_check()
+
+    def _writer_loop(self):
+        """Background thread: write queued bursts to disk."""
+        while True:
+            path, frames, times = self._writer_queue.get()
+            try:
+                t0 = time.monotonic()
+                np.savez(path, frames=frames, timestamps=times)
+                log.info(f"Saved {os.path.basename(path)} "
+                         f"({frames.nbytes / 1e6:.0f} MB "
+                         f"in {time.monotonic() - t0:.1f}s)")
+            except Exception as e:
+                log.error(f"Write failed for {path}: {e}")
+            finally:
+                self._writer_queue.task_done()
+
+    def _update_thumbnail(self, frame):
+        """Store a half-resolution JPEG of a (2D) frame for /last.jpg."""
         if simplejpeg is None:
             return
         try:
-            arr = request.make_array("main")
-            thumb = arr[::2, ::2, :3] if arr.ndim == 3 else arr[::2, ::2]
-            thumb = np.ascontiguousarray(thumb)
-            if thumb.ndim == 2:
-                thumb = np.ascontiguousarray(
-                    np.repeat(thumb[:, :, None], 3, axis=2))
+            thumb = np.ascontiguousarray(frame[::2, ::2])
+            thumb = np.ascontiguousarray(
+                np.repeat(thumb[:, :, None], 3, axis=2))
             self.last_jpeg = simplejpeg.encode_jpeg(
                 thumb, quality=80, colorspace="BGR")
         except Exception as e:
@@ -432,6 +491,8 @@ class CameraManager:
             "mode": self.mode,
             "healthy": self.healthy,
             "capture_count": self.capture_count,
+            "burst_count": self.burst_count,
+            "buffering": len(self._burst_frames),
             "last_capture_time": self.last_capture_time,
             "session_dir": self.session_dir,
             "storage_usage": round(
@@ -607,6 +668,10 @@ class AgentHandler(BaseHTTPRequestHandler):
                 elif self.path == "/trigger/period":
                     ms = int(body["period_ms"])
                     resp = arduino.command(f"T{ms}")
+                elif self.path == "/trigger/fps":
+                    resp = arduino.command(f"F{int(body['fps'])}")
+                elif self.path == "/trigger/burst":
+                    resp = arduino.command(f"B{int(body['burst_ms'])}")
                 elif self.path == "/trigger/start":
                     resp = arduino.command("S")
                 elif self.path == "/trigger/stop":
