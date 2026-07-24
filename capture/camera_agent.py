@@ -240,6 +240,7 @@ class CameraManager:
     # ----- mode switching (main thread) -----
 
     def request_mode(self, mode: str):
+        log.info(f"Mode change requested: {mode}")
         with self.mode_lock:
             self.desired_mode = mode
 
@@ -413,7 +414,15 @@ class CameraManager:
     # ----- main loop -----
 
     def run(self):
+        last_heartbeat = time.monotonic()
         while True:
+            # Heartbeat proves the loop is alive while waiting for triggers
+            now = time.monotonic()
+            if now - last_heartbeat >= 10.0:
+                log.info(f"loop alive (mode={self.mode}, "
+                         f"desired={self.desired_mode})")
+                last_heartbeat = now
+
             with self.mode_lock:
                 desired = self.desired_mode
             if desired != self.mode:
