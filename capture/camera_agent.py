@@ -67,7 +67,7 @@ TRIGGER_MODE_PATH = "/sys/module/imx296/parameters/trigger_mode"
 SSD_MOUNT = "/media/pi/HIKSEMI"
 SD_FALLBACK = "/home/pi/PiCameraArray/data"
 
-CAPTURE_WAIT_CHUNK = 5.0     # SIGALRM chunk; mode-switch latency upper bound
+CAPTURE_WAIT_CHUNK = 1.0     # polling slice; mode-switch latency upper bound
 TRIGGER_TIMEOUT = 600.0      # warn if no trigger for this long
 MAX_STORAGE_PERCENT = 95.0
 MAX_TEMPERATURE = 90.0
