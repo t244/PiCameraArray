@@ -38,6 +38,7 @@ import time
 import signal
 import logging
 import threading
+import concurrent.futures
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -226,6 +227,7 @@ class CameraManager:
         self.capture_count = 0
         self.no_trigger_elapsed = 0.0
         self.healthy = True
+        self._pending_job = None
 
         # preview state
         self.exposure_us = DEFAULT_EXPOSURE_US
@@ -242,6 +244,7 @@ class CameraManager:
             self.desired_mode = mode
 
     def _close_camera(self):
+        self._pending_job = None
         self._focus_stop.set()
         if self._focus_thread is not None:
             self._focus_thread.join(timeout=3)
@@ -326,20 +329,36 @@ class CameraManager:
                 log.debug(f"focus loop error: {e}")
             self._focus_stop.wait(0.5)
 
-    # ----- capture loop (main thread, SIGALRM based) -----
-
-    def _alarm_handler(self, signum, frame):
-        raise TimeoutError()
+    # ----- capture loop (async job + polling; signal-free) -----
 
     def capture_one(self):
-        """Wait up to CAPTURE_WAIT_CHUNK for a trigger; save frame if received."""
-        signal.signal(signal.SIGALRM, self._alarm_handler)
-        signal.setitimer(signal.ITIMER_REAL, CAPTURE_WAIT_CHUNK)
-        try:
-            request = self.picam2.capture_request()
-            signal.setitimer(signal.ITIMER_REAL, 0)
-            self.no_trigger_elapsed = 0.0
+        """Poll for a triggered frame in CAPTURE_WAIT_CHUNK slices.
 
+        capture_request(wait=False) dispatches a job; get_result(timeout=...)
+        raises TimeoutError on expiry WITHOUT cancelling the job, so we can
+        return to the main loop (mode switching stays responsive) and keep
+        waiting on the same job next iteration.
+        """
+        try:
+            if self._pending_job is None:
+                self._pending_job = self.picam2.capture_request(wait=False)
+            request = self._pending_job.get_result(timeout=CAPTURE_WAIT_CHUNK)
+            self._pending_job = None
+        except (TimeoutError, concurrent.futures.TimeoutError):
+            # No trigger within this chunk; job stays pending.
+            self.no_trigger_elapsed += CAPTURE_WAIT_CHUNK
+            if self.no_trigger_elapsed >= TRIGGER_TIMEOUT:
+                log.warning(f"No trigger received in {TRIGGER_TIMEOUT:.0f}s")
+                self.no_trigger_elapsed = 0.0
+            return
+        except Exception as e:
+            self._pending_job = None
+            log.error(f"Capture failed: {e}")
+            time.sleep(1)
+            return
+
+        try:
+            self.no_trigger_elapsed = 0.0
             ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
             filename = f"{self.hostname}_{self.capture_count:06d}_{ts}.{IMAGE_FORMAT}"
             filepath = os.path.join(self.session_dir, filename)
@@ -350,16 +369,8 @@ class CameraManager:
 
             if self.capture_count % HEALTH_CHECK_INTERVAL == 0:
                 self._health_check()
-        except TimeoutError:
-            signal.setitimer(signal.ITIMER_REAL, 0)
-            self.no_trigger_elapsed += CAPTURE_WAIT_CHUNK
-            if self.no_trigger_elapsed >= TRIGGER_TIMEOUT:
-                log.warning(f"No trigger received in {TRIGGER_TIMEOUT:.0f}s")
-                self.no_trigger_elapsed = 0.0
         except Exception as e:
-            signal.setitimer(signal.ITIMER_REAL, 0)
-            log.error(f"Capture failed: {e}")
-            time.sleep(1)
+            log.error(f"Save failed: {e}")
 
     def _health_check(self):
         usage = get_storage_usage(self.session_dir)
