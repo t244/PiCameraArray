@@ -228,7 +228,7 @@ function attachStream(i) {
   const img = $(`img-${i}`);
   if (img.dataset.on === "1") return;
   img.dataset.on = "1";
-  img.src = `${hostUrl(hosts[i])}/stream.mjpg?t=${Date.now()}`;
+  img.src = `${hostUrl(hosts[i])}/stream.mjpg`;
   img.style.display = "";
   $(`noimg-${i}`).style.display = "none";
 }

@@ -469,6 +469,7 @@ class AgentHandler(BaseHTTPRequestHandler):
     # ----- GET -----
 
     def do_GET(self):
+        self.path = self.path.split("?", 1)[0]  # ignore query string
         if self.path == "/status":
             self._send_json(manager.status(
                 arduino.available if arduino else False))
