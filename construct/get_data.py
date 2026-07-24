@@ -100,11 +100,20 @@ def get_latest_directory(pi_name, remote_data_dir):
         return None
 
 
-def list_remote_pngs(pi_name, remote_dir):
-    """Return a set of PNG filenames in a remote directory."""
-    cmd = ssh_cmd(pi_name, f"ls {remote_dir} | grep '\\.png$' || true")
+DATA_EXTS = (".png", ".npz")  # single frames / burst archives
+
+
+def list_remote_data_files(pi_name, remote_dir):
+    """Return a set of data filenames (png/npz) in a remote directory."""
+    cmd = ssh_cmd(pi_name,
+                  f"ls {remote_dir} | grep -E '\\.(png|npz)$' || true")
     result = run_command(cmd, check=True)
     return {name for name in result.stdout.split() if name}
+
+
+def local_data_files(local_dir_path):
+    return {p.name for p in local_dir_path.iterdir()
+            if p.suffix in DATA_EXTS} if local_dir_path.exists() else set()
 
 
 def copy_data_from_pi(pi_name, remote_dir_name, remote_data_dir, local_dir):
@@ -142,8 +151,8 @@ def copy_missing_files_from_pi(pi_name, remote_dir_name, remote_data_dir,
         print(f"Syncing missing files from {pi_name}... ({remote_dir_name})")
 
         if IS_WINDOWS:
-            remote_files = list_remote_pngs(pi_name, remote)
-            local_files = {p.name for p in local_dir_path.glob("*.png")}
+            remote_files = list_remote_data_files(pi_name, remote)
+            local_files = local_data_files(local_dir_path)
             missing = sorted(remote_files - local_files)
             for name in missing:
                 cmd = ["pscp", "-pw", SSH_PASSWORD, "-q",
@@ -188,19 +197,20 @@ def count_remote_png_files(pi_name, remote_dir_name, remote_data_dir):
     try:
         cmd = ssh_cmd(
             pi_name,
-            f"find {remote_data_dir}/{remote_dir_name} -name '*.png' | wc -l")
+            f"find {remote_data_dir}/{remote_dir_name} "
+            f"\\( -name '*.png' -o -name '*.npz' \\) | wc -l")
         result = run_command(cmd, check=True)
         return int(result.stdout.strip())
     except Exception as e:
-        print(f"  Error counting remote PNG files on {pi_name}: {e}")
+        print(f"  Error counting remote data files on {pi_name}: {e}")
         return -1
 
 
 def count_local_png_files(local_dir_path):
-    """Count PNG files in a local directory recursively."""
+    """Count data files (png/npz) in a local directory recursively."""
     if not local_dir_path.exists():
         return 0
-    return sum(1 for _ in local_dir_path.rglob("*.png"))
+    return sum(1 for p in local_dir_path.rglob("*") if p.suffix in DATA_EXTS)
 
 
 def is_copy_complete(pi_name, remote_dir_name, remote_data_dir,
