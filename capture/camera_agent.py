@@ -251,6 +251,13 @@ class CameraManager:
             self._focus_thread.join(timeout=3)
             self._focus_thread = None
         if self.picam2 is not None:
+            # Cancel pending capture_request jobs first: without a trigger
+            # they never complete, and stop() would queue behind them
+            # (this caused minutes-long mode-switch delays).
+            try:
+                self.picam2.cancel_all_and_flush()
+            except Exception as e:
+                log.debug(f"cancel_all_and_flush: {e}")
             try:
                 if self.mode == self.MODE_PREVIEW:
                     self.picam2.stop_recording()
@@ -589,6 +596,11 @@ class AgentHandler(BaseHTTPRequestHandler):
 # ==================== MAIN ====================
 
 def main():
+    if os.geteuid() != 0:
+        log.error("Root required for trigger_mode control - "
+                  "run with: sudo python3 camera_agent.py")
+        return 1
+
     global arduino
     arduino = ArduinoLink()
 
