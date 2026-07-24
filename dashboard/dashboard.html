@@ -193,9 +193,8 @@ async function setAllMode(mode) {
   logMsg(`全台を ${mode} に切替中...`);
   const res = await forAllHosts(h => api(h, "/mode", "POST", { mode }));
   const ok = res.filter(r => r.status === "fulfilled").length;
-  logMsg(`${mode}: ${ok}/${N} 台成功`);
-  if (mode === "preview") setTimeout(attachStreams, 6000); // mode switch takes a few s
-  else detachStreams();
+  logMsg(`${mode}: ${ok}/${N} 台成功（ストリームは自動接続）`);
+  // stream attach/detach is driven by poll() based on reported mode
 }
 
 async function applyControls() {
@@ -224,22 +223,22 @@ async function triggerCmd(cmd) {
   } catch (e) { logMsg(`trigger ${cmd} 失敗: ${e}`); }
 }
 
-// ---- streams ----
-function attachStreams() {
-  hosts.forEach((h, i) => {
-    const img = $(`img-${i}`);
-    img.src = `${hostUrl(h)}/stream.mjpg?t=${Date.now()}`;
-    img.style.display = "";
-    $(`noimg-${i}`).style.display = "none";
-  });
+// ---- streams (attached/detached automatically from poll()) ----
+function attachStream(i) {
+  const img = $(`img-${i}`);
+  if (img.dataset.on === "1") return;
+  img.dataset.on = "1";
+  img.src = `${hostUrl(hosts[i])}/stream.mjpg?t=${Date.now()}`;
+  img.style.display = "";
+  $(`noimg-${i}`).style.display = "none";
 }
-function detachStreams() {
-  hosts.forEach((_, i) => {
-    const img = $(`img-${i}`);
-    img.src = "";
-    img.style.display = "none";
-    $(`noimg-${i}`).style.display = "";
-  });
+function detachStream(i) {
+  const img = $(`img-${i}`);
+  if (img.dataset.on !== "1") return;
+  img.dataset.on = "0";
+  img.src = "";
+  img.style.display = "none";
+  $(`noimg-${i}`).style.display = "";
 }
 
 // ---- status polling ----
@@ -254,6 +253,7 @@ async function poll() {
       const s = r.value;
       badge.textContent = s.mode || "?";
       badge.className = `badge ${s.mode || "offline"}`;
+      if (s.mode === "preview") attachStream(i); else detachStream(i);
       const t = s.cpu_temp != null ? `${s.cpu_temp.toFixed(0)}°C` : "";
       const st = s.storage_usage != null ? `${s.storage_usage}%` : "";
       const exp = s.actual_exposure_us != null ? `${s.actual_exposure_us}µs` : "";
@@ -267,6 +267,7 @@ async function poll() {
       badge.textContent = "offline";
       badge.className = "badge offline";
       meta.textContent = ""; focus.textContent = "";
+      detachStream(i);
     }
   });
   if (foundMaster !== masterHost) {
