@@ -4,6 +4,9 @@ sudo apt update && sudo apt full-upgrade -y
 # Install libcamera apps
 sudo apt install -y libcamera-apps python3-picamera2
 
+# Install pyserial (used by camera_agent.py on the master Pi with the Arduino)
+sudo apt install -y python3-serial
+
 # Enable Wayland service
 sudo systemctl enable wayvnc.service
 sudo systemctl start wayvnc.service

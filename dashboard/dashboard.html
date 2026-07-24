@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>PiCameraArray Dashboard</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: #14161a; color: #e8e8e8;
+    font-family: "Segoe UI", system-ui, sans-serif; font-size: 14px;
+  }
+  header {
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    padding: 10px 16px; background: #1e2127; border-bottom: 1px solid #333;
+    position: sticky; top: 0; z-index: 10;
+  }
+  header h1 { font-size: 16px; margin: 0 12px 0 0; }
+  .ctl { display: flex; align-items: center; gap: 6px; }
+  .ctl label { color: #9aa0a8; }
+  input[type=text], input[type=number] {
+    background: #14161a; color: #e8e8e8; border: 1px solid #444;
+    border-radius: 4px; padding: 4px 8px; width: 110px;
+  }
+  input[type=range] { width: 180px; }
+  button {
+    background: #2d6cdf; color: #fff; border: 0; border-radius: 4px;
+    padding: 6px 12px; cursor: pointer; font-size: 13px;
+  }
+  button:hover { filter: brightness(1.15); }
+  button.gray { background: #454a52; }
+  button.red { background: #c0392b; }
+  button.green { background: #1e8e4e; }
+  #grid {
+    display: grid; grid-template-columns: repeat(4, 1fr);
+    gap: 8px; padding: 8px;
+  }
+  .card {
+    background: #1e2127; border: 1px solid #333; border-radius: 6px;
+    overflow: hidden; cursor: pointer;
+  }
+  .card.zoom { grid-column: 1 / -1; }
+  .card img { width: 100%; display: block; background: #000; aspect-ratio: 4/3; object-fit: contain; }
+  .card .noimg {
+    width: 100%; aspect-ratio: 4/3; display: flex; align-items: center;
+    justify-content: center; color: #666; background: #0c0d10;
+  }
+  .bar {
+    display: flex; align-items: center; gap: 8px; padding: 4px 8px;
+    font-size: 12px;
+  }
+  .bar .name { font-weight: 600; }
+  .badge { padding: 1px 7px; border-radius: 8px; font-size: 11px; }
+  .badge.preview { background: #1e8e4e; }
+  .badge.capture { background: #2d6cdf; }
+  .badge.offline { background: #666; }
+  .badge.red { background: #c0392b; }
+  .focus { margin-left: auto; font-variant-numeric: tabular-nums; }
+  .meta { color: #9aa0a8; }
+  #log {
+    padding: 6px 16px; color: #9aa0a8; font-size: 12px; white-space: pre-wrap;
+    font-family: Consolas, monospace;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>PiCameraArray</h1>
+
+  <div class="ctl">
+    <label>Hosts</label>
+    <input type="text" id="hostPattern" value="e{NN}" title="{NN}が00〜15に展開される。mDNS利用時は e{NN}.local">
+    <button class="gray" onclick="applyHosts()">適用</button>
+  </div>
+
+  <div class="ctl">
+    <button class="green" onclick="setAllMode('preview')">全台 Preview</button>
+    <button onclick="setAllMode('capture')">全台 Capture</button>
+  </div>
+
+  <div class="ctl">
+    <label>露光 (µs)</label>
+    <input type="range" id="expSlider" min="2" max="5" step="0.01" value="4"
+           oninput="sliderChanged()">
+    <input type="number" id="expNum" value="10000" min="100" max="100000" step="100"
+           onchange="numChanged()">
+    <label>Gain</label>
+    <input type="number" id="gainNum" value="1.0" min="1" max="16" step="0.5" style="width:60px">
+    <button class="gray" onclick="applyControls()">Previewに反映</button>
+  </div>
+
+  <div class="ctl">
+    <button onclick="writeArduino()">Arduinoへ書込み</button>
+    <button class="green" onclick="triggerCmd('start')">トリガ開始</button>
+    <button class="red" onclick="triggerCmd('stop')">トリガ停止</button>
+  </div>
+</header>
+
+<div id="grid"></div>
+<div id="log"></div>
+
+<script>
+const PORT = 8000;
+const N = 16;
+let hosts = [];
+let masterHost = null;      // host whose /status reports has_arduino
+let zoomed = null;
+
+const $ = id => document.getElementById(id);
+const logEl = $("log");
+
+function logMsg(msg) {
+  const t = new Date().toLocaleTimeString();
+  logEl.textContent = `[${t}] ${msg}\n` + logEl.textContent.split("\n").slice(0, 30).join("\n");
+}
+
+function hostUrl(h) { return `http://${h}:${PORT}`; }
+
+function buildHosts() {
+  const pat = $("hostPattern").value.trim() || "e{NN}";
+  hosts = [];
+  for (let i = 0; i < N; i++) {
+    hosts.push(pat.replace("{NN}", String(i).padStart(2, "0")));
+  }
+}
+
+function buildGrid() {
+  const grid = $("grid");
+  grid.innerHTML = "";
+  hosts.forEach((h, i) => {
+    const card = document.createElement("div");
+    card.className = "card";
+    card.id = `card-${i}`;
+    card.onclick = () => toggleZoom(i);
+    card.innerHTML = `
+      <div class="noimg" id="noimg-${i}">no stream</div>
+      <img id="img-${i}" style="display:none" alt="${h}">
+      <div class="bar">
+        <span class="name">${h}</span>
+        <span class="badge offline" id="badge-${i}">offline</span>
+        <span class="meta" id="meta-${i}"></span>
+        <span class="focus" id="focus-${i}"></span>
+      </div>`;
+    grid.appendChild(card);
+  });
+}
+
+function toggleZoom(i) {
+  const card = $(`card-${i}`);
+  if (zoomed === i) { card.classList.remove("zoom"); zoomed = null; }
+  else {
+    if (zoomed !== null) $(`card-${zoomed}`).classList.remove("zoom");
+    card.classList.add("zoom"); zoomed = i;
+    card.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+}
+
+function applyHosts() {
+  buildHosts();
+  buildGrid();
+  localStorage.setItem("hostPattern", $("hostPattern").value);
+  logMsg(`hosts: ${hosts[0]} .. ${hosts[N-1]}`);
+}
+
+// ---- exposure slider (log scale: 10^2 .. 10^5 µs) ----
+function sliderChanged() {
+  const us = Math.round(Math.pow(10, parseFloat($("expSlider").value)) / 100) * 100;
+  $("expNum").value = us;
+}
+function numChanged() {
+  const us = Math.max(100, parseInt($("expNum").value) || 10000);
+  $("expSlider").value = Math.log10(us).toFixed(2);
+}
+
+// ---- API helpers ----
+async function api(host, path, method = "GET", body = null) {
+  const opts = { method, signal: AbortSignal.timeout(8000) };
+  if (body) {
+    opts.headers = { "Content-Type": "application/json" };
+    opts.body = JSON.stringify(body);
+  }
+  const r = await fetch(`${hostUrl(host)}${path}`, opts);
+  return r.json();
+}
+
+async function forAllHosts(fn) {
+  return Promise.allSettled(hosts.map(fn));
+}
+
+// ---- actions ----
+async function setAllMode(mode) {
+  logMsg(`全台を ${mode} に切替中...`);
+  const res = await forAllHosts(h => api(h, "/mode", "POST", { mode }));
+  const ok = res.filter(r => r.status === "fulfilled").length;
+  logMsg(`${mode}: ${ok}/${N} 台成功`);
+  if (mode === "preview") setTimeout(attachStreams, 6000); // mode switch takes a few s
+  else detachStreams();
+}
+
+async function applyControls() {
+  const exposure_us = parseInt($("expNum").value);
+  const gain = parseFloat($("gainNum").value);
+  const res = await forAllHosts(h =>
+    api(h, "/controls", "POST", { exposure_us, gain }));
+  const ok = res.filter(r => r.status === "fulfilled" && r.value.ok).length;
+  logMsg(`露光 ${exposure_us}µs / gain ${gain} を ${ok} 台に適用`);
+}
+
+async function writeArduino() {
+  if (!masterHost) { logMsg("エラー: Arduino接続ホストが見つかりません"); return; }
+  const exposure_us = parseInt($("expNum").value);
+  try {
+    const r = await api(masterHost, "/trigger/exposure", "POST", { exposure_us });
+    logMsg(`Arduino (${masterHost}): ${r.response || JSON.stringify(r)}`);
+  } catch (e) { logMsg(`Arduino書込み失敗: ${e}`); }
+}
+
+async function triggerCmd(cmd) {
+  if (!masterHost) { logMsg("エラー: Arduino接続ホストが見つかりません"); return; }
+  try {
+    const r = await api(masterHost, `/trigger/${cmd}`, "POST", {});
+    logMsg(`Arduino ${cmd}: ${r.response || JSON.stringify(r)}`);
+  } catch (e) { logMsg(`trigger ${cmd} 失敗: ${e}`); }
+}
+
+// ---- streams ----
+function attachStreams() {
+  hosts.forEach((h, i) => {
+    const img = $(`img-${i}`);
+    img.src = `${hostUrl(h)}/stream.mjpg?t=${Date.now()}`;
+    img.style.display = "";
+    $(`noimg-${i}`).style.display = "none";
+  });
+}
+function detachStreams() {
+  hosts.forEach((_, i) => {
+    const img = $(`img-${i}`);
+    img.src = "";
+    img.style.display = "none";
+    $(`noimg-${i}`).style.display = "";
+  });
+}
+
+// ---- status polling ----
+async function poll() {
+  const results = await forAllHosts(h => api(h, "/status"));
+  let foundMaster = null;
+  results.forEach((r, i) => {
+    const badge = $(`badge-${i}`);
+    const meta = $(`meta-${i}`);
+    const focus = $(`focus-${i}`);
+    if (r.status === "fulfilled") {
+      const s = r.value;
+      badge.textContent = s.mode || "?";
+      badge.className = `badge ${s.mode || "offline"}`;
+      const t = s.cpu_temp != null ? `${s.cpu_temp.toFixed(0)}°C` : "";
+      const st = s.storage_usage != null ? `${s.storage_usage}%` : "";
+      const exp = s.actual_exposure_us != null ? `${s.actual_exposure_us}µs` : "";
+      meta.textContent = s.mode === "capture"
+        ? `#${s.capture_count} ${t} ${st}` : `${exp} ${t}`;
+      focus.textContent = (s.mode === "preview" && s.focus != null)
+        ? `F:${s.focus.toFixed(0)}` : "";
+      if (s.has_arduino) foundMaster = hosts[i];
+      if (!s.healthy) badge.className = "badge red";
+    } else {
+      badge.textContent = "offline";
+      badge.className = "badge offline";
+      meta.textContent = ""; focus.textContent = "";
+    }
+  });
+  if (foundMaster !== masterHost) {
+    masterHost = foundMaster;
+    if (masterHost) logMsg(`Arduinoマスター: ${masterHost}`);
+  }
+}
+
+// ---- init ----
+const saved = localStorage.getItem("hostPattern");
+if (saved) $("hostPattern").value = saved;
+buildHosts();
+buildGrid();
+numChanged();
+poll();
+setInterval(poll, 2000);
+</script>
+</body>
+</html>

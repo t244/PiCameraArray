@@ -124,3 +124,6 @@ collected_data/
 packed_data/
 comparisons/
 20260217_dataset/
+
+# Keep the dashboard despite *.html rule
+!dashboard/dashboard.html

@@ -15,6 +15,46 @@ A Python library for managing multiple camera modules on Raspberry Pi systems.
 - Python 3.7+
 - picamera library
 
+## Setup & Operation (Camera Agent)
+
+Each Pi runs `capture/camera_agent.py` as a resident service (port 8000).
+It boots into **capture** mode (external trigger, headless) and can be
+switched to **preview** mode (free-running MJPEG stream) via HTTP for
+on-site focusing and exposure adjustment.
+
+### Field setup workflow
+
+1. Power on the array. Bring a portable router (local AP, no internet
+   needed); connect the laptop to the same SSID as the Pis.
+2. Open `dashboard/dashboard.html` in a browser (set the host pattern,
+   e.g. `e{NN}` or `e{NN}.local`).
+3. Click **全台 Preview** — all 16 streams appear with a live focus
+   metric (higher = sharper). Adjust each lens.
+4. Adjust the exposure slider and **Previewに反映** until the image looks
+   right (fully manual; the same value is applied to all cameras).
+5. **Arduinoへ書込み** — sends `E<us>` to the Arduino via the master Pi
+   (the Pi with the USB serial connection); saved to EEPROM.
+6. **全台 Capture**, then **トリガ開始**.
+7. Remove the router. From now on the system is fully headless: on
+   power-up the Pis boot into capture mode and the Arduino auto-starts
+   after 2 minutes using the EEPROM exposure value.
+
+### Agent HTTP API (port 8000)
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/status` | GET | mode, focus, temp, storage, capture count |
+| `/mode` | POST | `{"mode": "preview"\|"capture"}` |
+| `/stream.mjpg` | GET | MJPEG stream (preview only) |
+| `/controls` | POST | `{"exposure_us": int, "gain": float}` (preview only) |
+| `/trigger/exposure` | POST | `{"exposure_us": int}` → Arduino `E` (master only) |
+| `/trigger/period` | POST | `{"period_ms": int}` → Arduino `T` (master only) |
+| `/trigger/start` `/trigger/stop` | POST | Arduino `S` / `P` (master only) |
+| `/trigger/status` | GET | Arduino `R` (master only) |
+
+Note: in IMX296 trigger mode the exposure time equals the trigger pulse
+width, so the exposure is a single global value for the whole array.
+
 ## Documentation
 
 For detailed documentation, see the [docs](./docs) directory.
