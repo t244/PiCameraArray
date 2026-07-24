@@ -80,10 +80,10 @@
   </div>
 
   <div class="ctl">
-    <label>露光 (µs)</label>
-    <input type="range" id="expSlider" min="2" max="5" step="0.01" value="4"
+    <label>露光 (ms)</label>
+    <input type="range" id="expSlider" min="-1" max="4" step="0.01" value="1"
            oninput="sliderChanged()">
-    <input type="number" id="expNum" value="10000" min="100" max="100000" step="100"
+    <input type="number" id="expNum" value="10" min="0.1" max="10000" step="0.1"
            onchange="numChanged()">
     <label>Gain</label>
     <input type="number" id="gainNum" value="1.0" min="1" max="16" step="0.5" style="width:60px">
@@ -163,14 +163,22 @@ function applyHosts() {
   logMsg(`hosts: ${hosts[0]} .. ${hosts[N-1]}`);
 }
 
-// ---- exposure slider (log scale: 10^2 .. 10^5 µs) ----
+// ---- exposure slider (ms, log scale: 0.1 .. 10000 ms) ----
 function sliderChanged() {
-  const us = Math.round(Math.pow(10, parseFloat($("expSlider").value)) / 100) * 100;
-  $("expNum").value = us;
+  const ms = Math.pow(10, parseFloat($("expSlider").value));
+  // round to 2 significant-ish digits for a clean display
+  const rounded = ms < 1 ? Math.round(ms * 100) / 100
+                : ms < 100 ? Math.round(ms * 10) / 10
+                : Math.round(ms);
+  $("expNum").value = rounded;
 }
 function numChanged() {
-  const us = Math.max(100, parseInt($("expNum").value) || 10000);
-  $("expSlider").value = Math.log10(us).toFixed(2);
+  const ms = Math.min(10000, Math.max(0.1, parseFloat($("expNum").value) || 10));
+  $("expNum").value = ms;
+  $("expSlider").value = Math.log10(ms).toFixed(2);
+}
+function exposureUs() {
+  return Math.round(parseFloat($("expNum").value) * 1000);  // ms -> µs
 }
 
 // ---- API helpers ----
@@ -198,17 +206,17 @@ async function setAllMode(mode) {
 }
 
 async function applyControls() {
-  const exposure_us = parseInt($("expNum").value);
+  const exposure_us = exposureUs();
   const gain = parseFloat($("gainNum").value);
   const res = await forAllHosts(h =>
     api(h, "/controls", "POST", { exposure_us, gain }));
   const ok = res.filter(r => r.status === "fulfilled" && r.value.ok).length;
-  logMsg(`露光 ${exposure_us}µs / gain ${gain} を ${ok} 台に適用`);
+  logMsg(`露光 ${exposure_us / 1000}ms / gain ${gain} を ${ok} 台に適用`);
 }
 
 async function writeArduino() {
   if (!masterHost) { logMsg("エラー: Arduino接続ホストが見つかりません"); return; }
-  const exposure_us = parseInt($("expNum").value);
+  const exposure_us = exposureUs();
   try {
     const r = await api(masterHost, "/trigger/exposure", "POST", { exposure_us });
     logMsg(`Arduino (${masterHost}): ${r.response || JSON.stringify(r)}`);
@@ -256,7 +264,8 @@ async function poll() {
       if (s.mode === "preview") attachStream(i); else detachStream(i);
       const t = s.cpu_temp != null ? `${s.cpu_temp.toFixed(0)}°C` : "";
       const st = s.storage_usage != null ? `${s.storage_usage}%` : "";
-      const exp = s.actual_exposure_us != null ? `${s.actual_exposure_us}µs` : "";
+      const exp = s.actual_exposure_us != null
+        ? `${(s.actual_exposure_us / 1000).toFixed(1)}ms` : "";
       meta.textContent = s.mode === "capture"
         ? `#${s.capture_count} ${t} ${st}` : `${exp} ${t}`;
       focus.textContent = (s.mode === "preview" && s.focus != null)

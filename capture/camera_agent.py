@@ -289,8 +289,10 @@ class CameraManager:
             main={"size": (PREVIEW_WIDTH, PREVIEW_HEIGHT)},
         )
         self.picam2.configure(config)
+        frame_us = max(int(self.exposure_us) + 1000, 33333)
         self.picam2.set_controls({
             "AeEnable": False,
+            "FrameDurationLimits": (frame_us, frame_us),
             "ExposureTime": int(self.exposure_us),
             "AnalogueGain": float(self.gain),
         })
@@ -310,8 +312,12 @@ class CameraManager:
             self.exposure_us = int(exposure_us)
         if gain is not None:
             self.gain = float(gain)
+        # Extend frame duration for long exposures (default video config
+        # caps exposure at the ~33ms frame time otherwise)
+        frame_us = max(int(self.exposure_us) + 1000, 33333)
         self.picam2.set_controls({
             "AeEnable": False,
+            "FrameDurationLimits": (frame_us, frame_us),
             "ExposureTime": int(self.exposure_us),
             "AnalogueGain": float(self.gain),
         })
