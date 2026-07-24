@@ -52,6 +52,11 @@ try:
 except ImportError:
     serial = None
 
+try:
+    import simplejpeg  # picamera2 dependency; used for capture thumbnails
+except ImportError:
+    simplejpeg = None
+
 
 # ==================== CONFIGURATION ====================
 
@@ -228,6 +233,8 @@ class CameraManager:
         self.no_trigger_elapsed = 0.0
         self.healthy = True
         self._pending_job = None
+        self.last_jpeg = None            # thumbnail of last captured frame
+        self.last_capture_time = None
 
         # preview state
         self.exposure_us = DEFAULT_EXPOSURE_US
@@ -377,14 +384,32 @@ class CameraManager:
             filename = f"{self.hostname}_{self.capture_count:06d}_{ts}.{IMAGE_FORMAT}"
             filepath = os.path.join(self.session_dir, filename)
             request.save("main", filepath)
+            self._update_thumbnail(request)
             request.release()
             self.capture_count += 1
+            self.last_capture_time = datetime.now().isoformat(timespec="seconds")
             log.info(f"Captured: {filename}")
 
             if self.capture_count % HEALTH_CHECK_INTERVAL == 0:
                 self._health_check()
         except Exception as e:
             log.error(f"Save failed: {e}")
+
+    def _update_thumbnail(self, request):
+        """Store a half-resolution JPEG of the captured frame for /last.jpg."""
+        if simplejpeg is None:
+            return
+        try:
+            arr = request.make_array("main")
+            thumb = arr[::2, ::2, :3] if arr.ndim == 3 else arr[::2, ::2]
+            thumb = np.ascontiguousarray(thumb)
+            if thumb.ndim == 2:
+                thumb = np.ascontiguousarray(
+                    np.repeat(thumb[:, :, None], 3, axis=2))
+            self.last_jpeg = simplejpeg.encode_jpeg(
+                thumb, quality=80, colorspace="BGR")
+        except Exception as e:
+            log.debug(f"thumbnail failed: {e}")
 
     def _health_check(self):
         usage = get_storage_usage(self.session_dir)
@@ -407,6 +432,7 @@ class CameraManager:
             "mode": self.mode,
             "healthy": self.healthy,
             "capture_count": self.capture_count,
+            "last_capture_time": self.last_capture_time,
             "session_dir": self.session_dir,
             "storage_usage": round(
                 get_storage_usage(self.session_dir or SD_FALLBACK), 1),
@@ -514,6 +540,19 @@ class AgentHandler(BaseHTTPRequestHandler):
                     self.wfile.write(b"\r\n")
             except (BrokenPipeError, ConnectionResetError):
                 pass
+
+        elif self.path == "/last.jpg":
+            if manager.last_jpeg is None:
+                self._send_json({"error": "no capture yet"}, 404)
+                return
+            body = manager.last_jpeg
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-cache, private")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(body)
 
         elif self.path == "/trigger/status":
             if not (arduino and arduino.available):

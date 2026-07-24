@@ -91,6 +91,8 @@
   </div>
 
   <div class="ctl">
+    <label>周期 (s)</label>
+    <input type="number" id="periodNum" value="30" min="0.5" max="3600" step="0.5" style="width:70px">
     <button onclick="writeArduino()">Arduinoへ書込み</button>
     <button class="green" onclick="triggerCmd('start')">トリガ開始</button>
     <button class="red" onclick="triggerCmd('stop')">トリガ停止</button>
@@ -217,9 +219,15 @@ async function applyControls() {
 async function writeArduino() {
   if (!masterHost) { logMsg("エラー: Arduino接続ホストが見つかりません"); return; }
   const exposure_us = exposureUs();
+  const period_ms = Math.round(parseFloat($("periodNum").value) * 1000);
+  if (exposure_us / 1000 >= period_ms) {
+    logMsg("エラー: 露光時間はトリガ周期より短くしてください"); return;
+  }
   try {
-    const r = await api(masterHost, "/trigger/exposure", "POST", { exposure_us });
-    logMsg(`Arduino (${masterHost}): ${r.response || JSON.stringify(r)}`);
+    const r1 = await api(masterHost, "/trigger/exposure", "POST", { exposure_us });
+    logMsg(`Arduino 露光 (${masterHost}): ${r1.response || JSON.stringify(r1)}`);
+    const r2 = await api(masterHost, "/trigger/period", "POST", { period_ms });
+    logMsg(`Arduino 周期 (${masterHost}): ${r2.response || JSON.stringify(r2)}`);
   } catch (e) { logMsg(`Arduino書込み失敗: ${e}`); }
 }
 
@@ -231,19 +239,26 @@ async function triggerCmd(cmd) {
   } catch (e) { logMsg(`trigger ${cmd} 失敗: ${e}`); }
 }
 
-// ---- streams (attached/detached automatically from poll()) ----
-function attachStream(i) {
+// ---- card images (driven by poll(): preview=MJPEG, capture=last shot) ----
+function showImage(i, kind, src) {
   const img = $(`img-${i}`);
-  if (img.dataset.on === "1") return;
-  img.dataset.on = "1";
-  img.src = `${hostUrl(hosts[i])}/stream.mjpg`;
+  if (img.dataset.kind === kind) return;
+  img.dataset.kind = kind;
+  img.src = src;
   img.style.display = "";
   $(`noimg-${i}`).style.display = "none";
 }
+function attachStream(i) {
+  showImage(i, "stream", `${hostUrl(hosts[i])}/stream.mjpg`);
+}
+function showLastCapture(i, count) {
+  // count in the kind key forces a reload after each new capture
+  showImage(i, `still-${count}`, `${hostUrl(hosts[i])}/last.jpg?c=${count}`);
+}
 function detachStream(i) {
   const img = $(`img-${i}`);
-  if (img.dataset.on !== "1") return;
-  img.dataset.on = "0";
+  if (!img.dataset.kind) return;
+  img.dataset.kind = "";
   img.src = "";
   img.style.display = "none";
   $(`noimg-${i}`).style.display = "";
@@ -261,13 +276,18 @@ async function poll() {
       const s = r.value;
       badge.textContent = s.mode || "?";
       badge.className = `badge ${s.mode || "offline"}`;
-      if (s.mode === "preview") attachStream(i); else detachStream(i);
+      if (s.mode === "preview") attachStream(i);
+      else if (s.mode === "capture" && s.capture_count > 0)
+        showLastCapture(i, s.capture_count);
+      else detachStream(i);
       const t = s.cpu_temp != null ? `${s.cpu_temp.toFixed(0)}°C` : "";
       const st = s.storage_usage != null ? `${s.storage_usage}%` : "";
       const exp = s.actual_exposure_us != null
         ? `${(s.actual_exposure_us / 1000).toFixed(1)}ms` : "";
+      const lastT = s.last_capture_time
+        ? s.last_capture_time.split("T")[1] : "";
       meta.textContent = s.mode === "capture"
-        ? `#${s.capture_count} ${t} ${st}` : `${exp} ${t}`;
+        ? `#${s.capture_count} ${lastT} ${t} ${st}` : `${exp} ${t}`;
       focus.textContent = (s.mode === "preview" && s.focus != null)
         ? `F:${s.focus.toFixed(0)}` : "";
       if (s.has_arduino) foundMaster = hosts[i];
