@@ -313,6 +313,15 @@ class CameraManager:
             buffer_count=CAPTURE_BUFFER_COUNT,
         )
         self.picam2.configure(config)
+        # Disable all per-frame automatics for quantitative capture:
+        # exposure is fixed by the trigger pulse width; gain must be fixed
+        # too, otherwise AGC ramps brightness over the first frames and
+        # drifts with scene changes. Uses the gain set in preview mode.
+        self.picam2.set_controls({
+            "AeEnable": False,
+            "AnalogueGain": float(self.gain),
+            "NoiseReductionMode": 0,  # off - keep pixel values unfiltered
+        })
         self.picam2.start()
         time.sleep(2)
         self.mode = self.MODE_CAPTURE
