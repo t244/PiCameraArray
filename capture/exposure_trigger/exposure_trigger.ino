@@ -95,6 +95,20 @@ void firePulse() {
   digitalWrite(SYNC_PIN, HIGH);
 }
 
+// Warm-up: the camera pipeline discards its first few frames after
+// (re)start, which would otherwise truncate the first real burst.
+// Fire a short pulse train to absorb those dropped frames.
+const unsigned long WARMUP_PULSES = 10;
+void fireWarmup() {
+  unsigned long interval_us = 1000000UL / fps;
+  if (exposure_us + 500 > interval_us) interval_us = exposure_us + 500;
+  for (unsigned long i = 0; i < WARMUP_PULSES; i++) {
+    unsigned long t0 = micros();
+    firePulse();
+    while ((unsigned long)(micros() - t0) < interval_us) { }
+  }
+}
+
 // Pulse train: n frames at fps. Blocking (a few seconds).
 void fireBurst() {
   unsigned long interval_us = 1000000UL / fps;
@@ -150,9 +164,11 @@ void handleCommand(String cmd) {
       } else Serial.println(F("ERR B range 100..30000"));
       break;
     case 'S': case 's':
-      running = true;
-      lastBurstTime = millis() - period_ms;     // first burst immediately
       Serial.println(F("OK S"));
+      fireWarmup();                             // absorb pipeline drop-frames
+      delay(2000);
+      running = true;
+      lastBurstTime = millis() - period_ms;     // first real burst immediately
       break;
     case 'P': case 'p':
       running = false;
@@ -197,8 +213,10 @@ void loop() {
 
   // --- Headless fail-safe auto start ---
   if (!running && !commandReceived && now >= AUTO_START_DELAY_MS) {
+    fireWarmup();                     // absorb pipeline drop-frames
+    delay(2000);
     running = true;
-    lastBurstTime = now - period_ms;  // start first burst immediately
+    lastBurstTime = millis() - period_ms;  // first real burst immediately
   }
 
   // --- Periodic burst ---

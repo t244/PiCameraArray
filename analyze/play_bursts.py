@@ -29,6 +29,7 @@ Keys:
 import argparse
 import re
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -162,6 +163,10 @@ def main():
     win = f"PiCameraArray burst {args.burst} (q:quit space:pause a/d:step +/-:speed)"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
 
+    # Wall-clock scheduling: rendering time is subtracted from the wait so
+    # 90 frames at 30 fps really take 3.0 s (not 3 s + render overhead)
+    next_t = time.perf_counter()
+
     while True:
         mosaic = make_mosaic(data, idx, tile_h, tile_w)
         status = (f"frame {idx + 1}/{n_frames}  {fps:.0f}fps"
@@ -171,25 +176,35 @@ def main():
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, 255, 1, cv2.LINE_AA)
         cv2.imshow(win, mosaic)
 
-        key = cv2.waitKey(0 if paused else max(1, int(1000 / fps))) & 0xFF
+        if paused:
+            delay_ms = 0  # wait for a key indefinitely
+        else:
+            next_t += 1.0 / fps
+            delay_ms = max(1, int((next_t - time.perf_counter()) * 1000))
+        key = cv2.waitKey(delay_ms) & 0xFF
         if key in (ord("q"), 27):
             break
         elif key == ord(" "):
             paused = not paused
+            next_t = time.perf_counter()  # reset schedule on resume
         elif key == ord("d"):
             idx = min(idx + 1, n_frames - 1)
         elif key == ord("a"):
             idx = max(idx - 1, 0)
         elif key in (ord("+"), ord(";")):
             fps = min(fps * 1.5, 240)
+            next_t = time.perf_counter()
         elif key == ord("-"):
             fps = max(fps / 1.5, 1)
+            next_t = time.perf_counter()
         elif key == ord("r"):
             idx = 0
+            next_t = time.perf_counter()
         elif not paused:
             idx += 1
             if idx >= n_frames:
                 idx = 0  # loop
+                next_t = time.perf_counter()
 
         if cv2.getWindowProperty(win, cv2.WND_PROP_VISIBLE) < 1:
             break
