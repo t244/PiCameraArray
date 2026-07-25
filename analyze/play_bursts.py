@@ -27,9 +27,11 @@ Keys:
 """
 
 import argparse
+import os
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -56,39 +58,56 @@ def find_bursts(session_dir: Path):
     return bursts
 
 
-def load_burst(files: dict, scale: float):
-    """Load all hosts' frames for one burst, downscaled to 8-bit tiles.
+def _load_one(host: str, path: Path, scale: float):
+    """Load one host's burst, downscaled to 8-bit tiles.
 
     Raw bursts (frames_raw, CSI2-packed 10-bit) are unpacked frame by
     frame and reduced to 8 bits for display, keeping memory bounded.
     """
+    d = np.load(path)
+    ts = d["timestamps"]
+    is_raw = "frames_raw" in d.files
+    if is_raw:
+        src = d["frames_raw"]
+        H, W = (int(x) for x in d["raw_shape"])
+    else:
+        src = d["frames"]
+        H, W = src.shape[1:3]
+
+    h = max(1, int(H * scale))
+    w = max(1, int(W * scale))
+    out = np.empty((len(src), h, w), np.uint8)
+    for i, f in enumerate(src):
+        g = ((unpack_raw10(f, W) >> 2).astype(np.uint8)
+             if is_raw else f)
+        out[i] = (cv2.resize(g, (w, h), interpolation=cv2.INTER_AREA)
+                  if scale != 1.0 else g)
+
+    print(f"  {host}: {path.name}  {len(out)} frames"
+          f"{'  (raw10)' if is_raw else ''}")
+    return host, out, ts
+
+
+def load_burst(files: dict, scale: float):
+    """Load all hosts' frames for one burst in parallel.
+
+    npz decompression-free reads, numpy unpacking and cv2.resize all
+    release the GIL, so a thread pool parallelizes across hosts.
+    """
+    t0 = time.perf_counter()
+    workers = min(len(files), os.cpu_count() or 4)
     data = {}
     n_min = None
-    for host, path in sorted(files.items()):
-        d = np.load(path)
-        ts = d["timestamps"]
-        is_raw = "frames_raw" in d.files
-        if is_raw:
-            src = d["frames_raw"]
-            H, W = (int(x) for x in d["raw_shape"])
-        else:
-            src = d["frames"]
-            H, W = src.shape[1:3]
-
-        h = max(1, int(H * scale))
-        w = max(1, int(W * scale))
-        out = np.empty((len(src), h, w), np.uint8)
-        for i, f in enumerate(src):
-            g = ((unpack_raw10(f, W) >> 2).astype(np.uint8)
-                 if is_raw else f)
-            out[i] = (cv2.resize(g, (w, h), interpolation=cv2.INTER_AREA)
-                      if scale != 1.0 else g)
-
-        data[host] = (out, ts)
-        n = len(out)
-        n_min = n if n_min is None else min(n_min, n)
-        print(f"  {host}: {path.name}  {n} frames"
-              f"{'  (raw10)' if is_raw else ''}")
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = [ex.submit(_load_one, host, path, scale)
+                   for host, path in sorted(files.items())]
+        for fut in futures:
+            host, out, ts = fut.result()
+            data[host] = (out, ts)
+            n = len(out)
+            n_min = n if n_min is None else min(n_min, n)
+    print(f"Loaded {len(data)} cameras in "
+          f"{time.perf_counter() - t0:.1f}s ({workers} threads)")
     return data, (n_min or 0)
 
 
