@@ -35,6 +35,8 @@ from pathlib import Path
 import numpy as np
 import cv2
 
+from raw10 import unpack_raw10
+
 HOSTS = [f"e{i:02d}" for i in range(16)]
 GRID = (4, 4)
 BURST_RE = re.compile(r"_burst(\d+)_")
@@ -55,23 +57,38 @@ def find_bursts(session_dir: Path):
 
 
 def load_burst(files: dict, scale: float):
-    """Load all hosts' frames for one burst, downscaled."""
+    """Load all hosts' frames for one burst, downscaled to 8-bit tiles.
+
+    Raw bursts (frames_raw, CSI2-packed 10-bit) are unpacked frame by
+    frame and reduced to 8 bits for display, keeping memory bounded.
+    """
     data = {}
     n_min = None
     for host, path in sorted(files.items()):
         d = np.load(path)
-        fr = d["frames"]
         ts = d["timestamps"]
-        if scale != 1.0:
-            h = max(1, int(fr.shape[1] * scale))
-            w = max(1, int(fr.shape[2] * scale))
-            fr = np.stack([
-                cv2.resize(f, (w, h), interpolation=cv2.INTER_AREA)
-                for f in fr])
-        data[host] = (fr, ts)
-        n = len(fr)
+        is_raw = "frames_raw" in d.files
+        if is_raw:
+            src = d["frames_raw"]
+            H, W = (int(x) for x in d["raw_shape"])
+        else:
+            src = d["frames"]
+            H, W = src.shape[1:3]
+
+        h = max(1, int(H * scale))
+        w = max(1, int(W * scale))
+        out = np.empty((len(src), h, w), np.uint8)
+        for i, f in enumerate(src):
+            g = ((unpack_raw10(f, W) >> 2).astype(np.uint8)
+                 if is_raw else f)
+            out[i] = (cv2.resize(g, (w, h), interpolation=cv2.INTER_AREA)
+                      if scale != 1.0 else g)
+
+        data[host] = (out, ts)
+        n = len(out)
         n_min = n if n_min is None else min(n_min, n)
-        print(f"  {host}: {path.name}  {n} frames")
+        print(f"  {host}: {path.name}  {n} frames"
+              f"{'  (raw10)' if is_raw else ''}")
     return data, (n_min or 0)
 
 

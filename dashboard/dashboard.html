@@ -237,8 +237,8 @@ async function writeArduino() {
     logMsg("エラー: バースト時間は周期より短くしてください"); return;
   }
   const nFrames = Math.floor(burst_ms * fps / 1000);
-  if (nFrames > 450) {
-    logMsg(`エラー: ${nFrames}枚/バーストはPiのRAMバッファ上限(450枚)を超えます`); return;
+  if (nFrames > 360) {
+    logMsg(`エラー: ${nFrames}枚/バーストはPiのRAMバッファ上限(360枚)を超えます`); return;
   }
 
   try {

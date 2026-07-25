@@ -79,8 +79,12 @@ TRIGGER_TIMEOUT = 600.0      # warn if no trigger for this long
 # Burst buffering: frames are accumulated in RAM during a trigger burst
 # and flushed to disk (npz) in the idle time between bursts.
 BURST_GAP_S = 0.8            # no frame for this long = burst has ended
-MAX_BURST_FRAMES = 450       # RAM safety cap (~710 MB at 8bit full res)
+MAX_BURST_FRAMES = 360       # RAM safety cap (~710 MB raw-packed full res)
 CAPTURE_BUFFER_COUNT = 16    # camera driver buffers for burst capture
+
+# Save the 10-bit packed raw stream (linear, no gamma/ALSC/denoise) for
+# spectral measurements. False = save the 8-bit Y plane instead.
+CAPTURE_RAW = True
 MAX_STORAGE_PERCENT = 95.0
 MAX_TEMPERATURE = 90.0
 TEMP_WARNING = 80.0
@@ -247,7 +251,10 @@ class CameraManager:
         self.burst_count = 0
         self._burst_frames = []
         self._burst_times = []
+        self._burst_meta = None          # per-burst sensor metadata
+        self._last_y_small = None        # half-res Y for thumbnails
         self._last_frame_mono = 0.0
+        self._raw_format = None
         self._writer_queue = queue.Queue()
         threading.Thread(target=self._writer_loop, daemon=True).start()
 
@@ -306,13 +313,20 @@ class CameraManager:
         self._burst_times = []
         self.no_trigger_elapsed = 0.0
         self.picam2 = Picamera2()
-        # Video configuration: YUV420 so the 8-bit Y plane can be grabbed
-        # cheaply at burst rates (the IMX296 used here is monochrome)
-        config = self.picam2.create_video_configuration(
-            main={"size": (IMAGE_WIDTH, IMAGE_HEIGHT), "format": "YUV420"},
-            buffer_count=CAPTURE_BUFFER_COUNT,
-        )
+        # Video configuration: main YUV420 for thumbnails; raw stream
+        # (10-bit packed, linear) is what gets saved when CAPTURE_RAW.
+        streams = {
+            "main": {"size": (IMAGE_WIDTH, IMAGE_HEIGHT), "format": "YUV420"},
+            "buffer_count": CAPTURE_BUFFER_COUNT,
+        }
+        if CAPTURE_RAW:
+            streams["raw"] = {"size": (IMAGE_WIDTH, IMAGE_HEIGHT)}
+        config = self.picam2.create_video_configuration(**streams)
         self.picam2.configure(config)
+        self._raw_format = (
+            self.picam2.camera_configuration().get("raw") or {}
+        ).get("format") if CAPTURE_RAW else None
+        self._burst_meta = None
         # Disable all per-frame automatics for quantitative capture:
         # exposure is fixed by the trigger pulse width; gain must be fixed
         # too, otherwise AGC ramps brightness over the first frames and
@@ -414,10 +428,23 @@ class CameraManager:
         try:
             self.no_trigger_elapsed = 0.0
             arr = request.make_array("main")
+            if CAPTURE_RAW:
+                frame = request.make_array("raw")  # (H, stride) packed uint8
+            if self._burst_meta is None:
+                md = request.get_metadata()
+                self._burst_meta = {
+                    "black_levels": md.get("SensorBlackLevels"),
+                    "analogue_gain": md.get("AnalogueGain"),
+                }
             request.release()
-            # YUV420 array is (H*3/2, W); the Y plane is the first H rows
-            y = np.ascontiguousarray(arr[:IMAGE_HEIGHT, :IMAGE_WIDTH])
-            self._burst_frames.append(y)
+            # YUV420 array is (H*3/2, W); the Y plane is the first H rows.
+            # Keep a half-res copy of the latest Y for the /last.jpg thumbnail
+            self._last_y_small = np.ascontiguousarray(
+                arr[:IMAGE_HEIGHT:2, :IMAGE_WIDTH:2])
+            if not CAPTURE_RAW:
+                frame = np.ascontiguousarray(
+                    arr[:IMAGE_HEIGHT, :IMAGE_WIDTH])
+            self._burst_frames.append(frame)
             self._burst_times.append(
                 datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3])
             self._last_frame_mono = time.monotonic()
@@ -437,29 +464,48 @@ class CameraManager:
             return
         frames = np.stack(self._burst_frames)
         times = np.array(self._burst_times)
+        meta = self._burst_meta or {}
         self._burst_frames = []
         self._burst_times = []
+        self._burst_meta = None
         self.burst_count += 1
 
         fname = (f"{self.hostname}_burst{self.burst_count:04d}"
                  f"_{times[0]}.npz")
         path = os.path.join(self.session_dir, fname)
-        self._writer_queue.put((path, frames, times))
+
+        if CAPTURE_RAW:
+            arrays = {
+                "frames_raw": frames,  # (N, H, stride) CSI2-packed 10bit
+                "timestamps": times,
+                "raw_format": np.array(self._raw_format or ""),
+                "raw_shape": np.array([IMAGE_HEIGHT, IMAGE_WIDTH]),
+                # SensorBlackLevels are on a 16-bit scale (>>6 for 10-bit)
+                "black_levels": np.array(meta.get("black_levels") or []),
+                "analogue_gain": np.array(meta.get("analogue_gain") or 0.0),
+            }
+        else:
+            arrays = {"frames": frames, "timestamps": times}
+
+        self._writer_queue.put((path, arrays))
         log.info(f"Burst {self.burst_count}: {len(times)} frames "
                  f"({frames.nbytes / 1e6:.0f} MB) queued -> {fname}")
 
-        self._update_thumbnail(frames[-1])
+        if self._last_y_small is not None:
+            self._update_thumbnail(self._last_y_small)
         self._health_check()
 
     def _writer_loop(self):
         """Background thread: write queued bursts to disk."""
         while True:
-            path, frames, times = self._writer_queue.get()
+            path, arrays = self._writer_queue.get()
             try:
                 t0 = time.monotonic()
-                np.savez(path, frames=frames, timestamps=times)
+                np.savez(path, **arrays)
+                nbytes = sum(a.nbytes for a in arrays.values()
+                             if isinstance(a, np.ndarray))
                 log.info(f"Saved {os.path.basename(path)} "
-                         f"({frames.nbytes / 1e6:.0f} MB "
+                         f"({nbytes / 1e6:.0f} MB "
                          f"in {time.monotonic() - t0:.1f}s)")
             except Exception as e:
                 log.error(f"Write failed for {path}: {e}")

@@ -63,12 +63,27 @@ width, so the exposure is a single global value for the whole array.
 The Arduino fires a pulse train every period: `fps` (default 30) pulses/s
 for `burst` (default 3 s) → 90 hardware-synchronized frames per burst.
 Each Pi buffers the frames in RAM and writes one npz file per burst
-(`<host>_burstNNNN_<timestamp>.npz`, keys `frames` (N,1088,1456) uint8 and
-`timestamps`) during the idle time between bursts.
+(`<host>_burstNNNN_<timestamp>.npz`) during the idle time between bursts.
+The first tiny burst after trigger start is warm-up (pipeline drop
+frames) — ignore it in analysis.
+
+With `CAPTURE_RAW = True` (default, for spectral measurements) the npz
+contains the linear 10-bit sensor data, bypassing gamma/ALSC/denoise:
+`frames_raw` (N,1088,stride) CSI2-packed uint8, `timestamps`,
+`raw_format`, `raw_shape`, `black_levels` (16-bit scale), and
+`analogue_gain`. Load with `analyze/raw10.py`:
+
+```python
+from raw10 import load_burst
+frames, ts, meta = load_burst("e00_burst0002_....npz")
+# frames: (N,1088,1456) uint16, linear, black level subtracted
+```
 
 Constraints: exposure < 1/fps (e.g. <33 ms at 30 fps, <15 ms at 60 fps);
-max 450 frames/burst (RAM); storage ≈ 1.58 MB × fps × burst_s per burst
-per camera (256 GB SSD ≈ 28 h at defaults: 30 fps × 3 s / 60 s period).
+max 360 frames/burst (RAM); storage ≈ 1.98 MB × fps × burst_s per burst
+per camera (256 GB SSD ≈ 22 h at defaults: 30 fps × 3 s / 60 s period).
+`analyze/play_bursts.py` plays a burst from all 16 cameras as a 4x4
+mosaic (handles both raw and 8-bit npz).
 
 ## Documentation
 
