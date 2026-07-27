@@ -305,7 +305,12 @@ async function poll() {
         showLastCapture(i, s.burst_count);  // thumbnail updates per burst
       else detachStream(i);
       const t = s.cpu_temp != null ? `${s.cpu_temp.toFixed(0)}°C` : "";
-      const st = s.storage_usage != null ? `${s.storage_usage}%` : "";
+      // Show where the data is actually landing. "3%" on a 250 GB SSD and
+      // "3%" on the SD card look identical otherwise, and a silent fallback
+      // to the card fills it in under an hour.
+      const free = s.storage_free_gb != null ? `${s.storage_free_gb.toFixed(0)}GB` : "";
+      const st = s.storage_usage == null ? ""
+        : (s.on_ssd === false ? `⚠SD ${free}` : `SSD ${free}`);
       const exp = s.actual_exposure_us != null
         ? `${(s.actual_exposure_us / 1000).toFixed(1)}ms` : "";
       const lastT = s.last_capture_time
@@ -318,6 +323,8 @@ async function poll() {
         ? `F:${s.focus.toFixed(0)}` : "";
       if (s.has_arduino) foundMaster = hosts[i];
       if (!s.healthy) badge.className = "badge red";
+      // Capturing to the SD card is a failure even though the agent is happy.
+      if (s.mode === "capture" && s.on_ssd === false) badge.className = "badge red";
     } else {
       badge.textContent = "offline";
       badge.className = "badge offline";

@@ -39,6 +39,7 @@ import signal
 import logging
 import threading
 import queue
+import subprocess
 import concurrent.futures
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -75,6 +76,11 @@ SD_FALLBACK = "/home/pi/PiCameraArray/data"
 
 CAPTURE_WAIT_CHUNK = 1.0     # polling slice; mode-switch latency upper bound
 TRIGGER_TIMEOUT = 600.0      # warn if no trigger for this long
+
+# How long to wait for the capture SSD before giving up and using the SD card.
+# A USB SSD can enumerate after systemd has passed local-fs.target, in which
+# case the fstab entry is never retried and the disk sits there unmounted.
+SSD_WAIT_S = 60.0
 
 # Burst buffering: frames are accumulated in RAM during a trigger burst
 # and flushed to disk (npz) in the idle time between bursts.
@@ -129,14 +135,69 @@ def get_storage_usage(path: str) -> float:
         return 0.0
 
 
+def get_storage_free_gb(path: str) -> float:
+    import shutil
+    try:
+        return shutil.disk_usage(path).free / 1e9
+    except Exception:
+        return 0.0
+
+
+def wait_for_ssd(timeout: float = SSD_WAIT_S) -> bool:
+    """Return True once the capture SSD is mounted, trying to mount it.
+
+    os.path.isdir() is not enough: the mount point is a permanent directory
+    created by prepare_ssd.sh, so it exists whether or not anything is
+    mounted on it. Only os.path.ismount() answers the real question.
+    """
+    if os.path.ismount(SSD_MOUNT):
+        return True
+    log.warning(f"{SSD_MOUNT} is not mounted - waiting up to {timeout:.0f}s")
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            subprocess.run(["mount", SSD_MOUNT], check=False,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=10)
+        except Exception as e:
+            log.debug(f"mount attempt failed: {e}")
+        if os.path.ismount(SSD_MOUNT):
+            log.info(f"{SSD_MOUNT} mounted")
+            return True
+        time.sleep(1.0)
+    return False
+
+
 def make_session_dir() -> str:
+    """Pick where this capture session writes, preferring the SSD.
+
+    Falling back to the SD card is almost never what we want: at the default
+    30 fps x 3 s burst every 60 s each camera writes ~178 MB per burst, so a
+    typical card fills in well under an hour. Make the fallback loud.
+    """
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    if os.path.isdir(SSD_MOUNT) and os.path.ismount(SSD_MOUNT):
+    if wait_for_ssd():
         path = f"{SSD_MOUNT}/data/{ts}"
+        log.info(f"recording to SSD: {path} "
+                 f"({get_storage_free_gb(SSD_MOUNT):.0f} GB free)")
     else:
         path = f"{SD_FALLBACK}/{ts}"
+        log.error("=" * 64)
+        log.error("SSD NOT AVAILABLE - falling back to the SD card.")
+        log.error("At default settings the SD card fills in under an hour.")
+        log.error(f"Recording to {path} "
+                  f"({get_storage_free_gb(SD_FALLBACK):.0f} GB free)")
+        log.error("=" * 64)
     os.makedirs(path, exist_ok=True)
     return path
+
+
+def session_on_ssd(session_dir) -> bool:
+    """True when the given session directory really lives on the SSD."""
+    if not session_dir:
+        return False
+    return (session_dir.startswith(SSD_MOUNT + "/")
+            and os.path.ismount(SSD_MOUNT))
 
 
 def set_trigger_mode(enabled: bool):
@@ -552,6 +613,11 @@ class CameraManager:
             "session_dir": self.session_dir,
             "storage_usage": round(
                 get_storage_usage(self.session_dir or SD_FALLBACK), 1),
+            # Distinguishes "3% used" on a 250 GB SSD from "3% used" on the
+            # SD card, which the dashboard otherwise renders identically.
+            "on_ssd": session_on_ssd(self.session_dir),
+            "storage_free_gb": round(
+                get_storage_free_gb(self.session_dir or SD_FALLBACK), 1),
             "cpu_temp": get_cpu_temp(),
             "focus": self.focus_value,
             "exposure_us": self.exposure_us,
