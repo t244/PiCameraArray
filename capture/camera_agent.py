@@ -93,6 +93,13 @@ CAPTURE_BUFFER_COUNT = 16    # camera driver buffers for burst capture
 # spectral measurements. False = save the 8-bit Y plane instead.
 CAPTURE_RAW = True
 MAX_STORAGE_PERCENT = 95.0
+
+# Halt capture when the CPU gets too hot. Off by default: the Pi already
+# throttles itself in hardware at 80/85 C, and losing an unattended field
+# session is worse than running warm. Nothing here ever resumes on its own -
+# healthy is only reset by enter_capture() - so a thermal stop would need
+# someone on site to notice. Temperatures are still logged either way.
+THERMAL_SHUTDOWN = False
 MAX_TEMPERATURE = 90.0
 TEMP_WARNING = 80.0
 HEALTH_CHECK_INTERVAL = 50   # captures between health checks
@@ -642,8 +649,13 @@ class CameraManager:
         temp = get_cpu_temp()
         if temp is not None:
             if temp > MAX_TEMPERATURE:
-                log.critical(f"Critical temperature: {temp}°C")
-                self.healthy = False
+                if THERMAL_SHUTDOWN:
+                    log.critical(f"Critical temperature: {temp}°C "
+                                 f"- stopping capture (THERMAL_SHUTDOWN)")
+                    self.healthy = False
+                else:
+                    log.critical(f"Critical temperature: {temp}°C "
+                                 f"- continuing, thermal shutdown is disabled")
             elif temp > TEMP_WARNING:
                 log.warning(f"High temperature: {temp}°C")
 
