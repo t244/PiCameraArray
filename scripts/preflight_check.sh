@@ -42,6 +42,16 @@ fi
 fstab="$(grep -c '^LABEL=HIKSEMI[[:space:]]' /etc/fstab 2>/dev/null | first)"
 out+=";fstab=${fstab:-0}"
 
+# Is a USB disk even enumerated? Distinguishes "the SSD is unplugged or the
+# port is dead" from "the SSD is there but was never formatted or mounted".
+usbdisk="$(lsblk -dn -o NAME,TRAN 2>/dev/null \
+           | grep -w usb | tr -s ' ' | cut -d' ' -f1 | paste -sd, - | first)"
+out+=";usbdisk=${usbdisk:--}"
+
+lbl=NO
+[ -e "/dev/disk/by-label/${LABEL_NAME:-HIKSEMI}" ] && lbl=yes
+out+=";label=$lbl"
+
 wifi="$(nmcli -t -f NAME,TYPE connection show 2>/dev/null \
         | awk -F: '$NF=="802-11-wireless"{NF--; print}' OFS=: \
         | while IFS= read -r n; do

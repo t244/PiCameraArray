@@ -106,8 +106,9 @@ else {
 $rows = foreach ($r in $raw) {
     if (-not $r.Line) {
         [pscustomobject]@{
-            Host = $r.Hostname; SSD = '?'; FSTAB = '?'; SVC = '?'; TRIG = '?'
-            SESS = '?'; WIFI = '?'; ARDUINO = '?'; Free = '-'; Temp = '-'
+            Host = $r.Hostname; DISK = '?'; FS = '?'; SSD = '?'; FSTAB = '?'
+            SVC = '?'; TRIG = '?'; SESS = '?'; WIFI = '?'; ARDUINO = '?'
+            Free = '-'; Temp = '-'
             Problems = @("UNREACHABLE: $($r.Error)")
         }
         continue
@@ -121,8 +122,18 @@ $rows = foreach ($r in $raw) {
 
     $problems = @()
 
+    # Order matters: report the deepest cause, not just the symptom.
+    $diskOk  = $kv['usbdisk'] -and $kv['usbdisk'] -ne '-'
+    $labelOk = $kv['label'] -eq 'yes'
+    if (-not $diskOk) {
+        $problems += "no USB disk enumerated - SSD unplugged, dead port, or no power"
+    }
+    elseif (-not $labelOk) {
+        $problems += "disk $($kv['usbdisk']) present but has no HIKSEMI filesystem - run deploy_prepare_ssd.ps1 -Format"
+    }
+
     $ssdOk = $kv['ssd'] -eq 'yes'
-    if (-not $ssdOk) { $problems += "SSD not mounted" }
+    if (-not $ssdOk -and $diskOk -and $labelOk) { $problems += "SSD present but not mounted" }
 
     $fstabOk = [int]($kv['fstab'] -as [int]) -ge 1
     if (-not $fstabOk) { $problems += "no fstab entry - mount will not survive reboot" }
@@ -144,6 +155,8 @@ $rows = foreach ($r in $raw) {
 
     [pscustomobject]@{
         Host    = $kv['host']
+        DISK    = if ($diskOk)  { $kv['usbdisk'] } else { 'NONE' }
+        FS      = if ($labelOk) { 'ok' } else { 'FAIL' }
         SSD     = if ($ssdOk)   { 'ok' } else { 'FAIL' }
         FSTAB   = if ($fstabOk) { 'ok' } else { 'FAIL' }
         SVC     = if ($svcOk)   { 'ok' } else { 'FAIL' }
@@ -161,8 +174,8 @@ $rows = foreach ($r in $raw) {
 
 Write-Host ""
 $rows | Sort-Object Host |
-    Format-Table Host, SSD, FSTAB, SVC, TRIG, SESS, WIFI, ARDUINO, Free, Temp -AutoSize |
-    Out-String -Width 200 | Write-Host
+    Format-Table Host, DISK, FS, SSD, FSTAB, SVC, TRIG, SESS, WIFI, ARDUINO, Free, Temp -AutoSize |
+    Out-String -Width 220 | Write-Host
 
 if ($Detail) {
     foreach ($r in $raw) { Write-Host "$($r.Hostname): $($r.Line)$($r.Error)" -ForegroundColor DarkGray }
