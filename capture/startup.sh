@@ -18,9 +18,13 @@ while ! mountpoint -q "$SSD_MOUNT" && [ $ELAPSED -lt $TIMEOUT ]; do
     # the disk sits there, healthy, and simply never gets mounted.
     # Mounting it ourselves is a no-op once it is up.
     if [ -e "/dev/disk/by-label/$SSD_LABEL" ]; then
-        mount "$SSD_MOUNT" 2>/dev/null \
-            || mount "/dev/disk/by-label/$SSD_LABEL" "$SSD_MOUNT" 2>/dev/null \
-            || true
+        # Try fstab, then by label, then by device node. Keep the last error:
+        # a silent failure here is what sends a whole session to the SD card.
+        MOUNT_ERR="$( { mount "$SSD_MOUNT" \
+            || mount -L "$SSD_LABEL" "$SSD_MOUNT" \
+            || mount "/dev/disk/by-label/$SSD_LABEL" "$SSD_MOUNT"; } 2>&1 )"
+    else
+        MOUNT_ERR="/dev/disk/by-label/$SSD_LABEL does not exist yet"
     fi
     mountpoint -q "$SSD_MOUNT" && break
     sleep 1
@@ -35,6 +39,7 @@ else
     echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
     echo "!! SSD NOT MOUNTED after ${TIMEOUT}s - falling back to the SD card."
     echo "!! At default settings the SD card fills in under an hour."
+    echo "!! Last mount error: ${MOUNT_ERR:-none}"
     if [ -e "/dev/disk/by-label/$SSD_LABEL" ]; then
         echo "!! The disk IS present but would not mount. Filesystem damaged?"
         echo "!!   sudo fsck -f /dev/disk/by-label/$SSD_LABEL"

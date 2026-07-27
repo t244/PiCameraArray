@@ -1,6 +1,11 @@
 [Unit]
 Description=PiCameraArray Trigger Capture Service
-After=local-fs.target
+# Wait for the capture SSD before starting. Wants+After (not Requires) so a
+# missing SSD still lets the agent come up and report the problem instead of
+# leaving the camera silently dead. The unit name is the escaped mount point
+# /media/pi/HIKSEMI; it exists because prepare_ssd.sh puts it in /etc/fstab.
+After=local-fs.target media-pi-HIKSEMI.mount
+Wants=media-pi-HIKSEMI.mount
 
 [Service]
 Type=simple

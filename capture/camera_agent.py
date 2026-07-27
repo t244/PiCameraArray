@@ -72,6 +72,7 @@ PREVIEW_HEIGHT = 544
 
 TRIGGER_MODE_PATH = "/sys/module/imx296/parameters/trigger_mode"
 SSD_MOUNT = "/media/pi/HIKSEMI"
+SSD_LABEL = "HIKSEMI"
 SD_FALLBACK = "/home/pi/PiCameraArray/data"
 
 CAPTURE_WAIT_CHUNK = 1.0     # polling slice; mode-switch latency upper bound
@@ -80,7 +81,7 @@ TRIGGER_TIMEOUT = 600.0      # warn if no trigger for this long
 # How long to wait for the capture SSD before giving up and using the SD card.
 # A USB SSD can enumerate after systemd has passed local-fs.target, in which
 # case the fstab entry is never retried and the disk sits there unmounted.
-SSD_WAIT_S = 60.0
+SSD_WAIT_S = 120.0
 
 # Burst buffering: frames are accumulated in RAM during a trigger burst
 # and flushed to disk (npz) in the idle time between bursts.
@@ -143,28 +144,75 @@ def get_storage_free_gb(path: str) -> float:
         return 0.0
 
 
+SSD_DEVICE_LINK = f"/dev/disk/by-label/{SSD_LABEL}"
+
+
+def _try_mount() -> str:
+    """Try every reasonable way to mount the SSD.
+
+    Returns "" on success, otherwise the collected error text. Never hide the
+    error: a silent failure here is what sends a whole session to the SD card.
+    """
+    attempts = [
+        ["mount", SSD_MOUNT],                       # via /etc/fstab
+        ["mount", "-L", SSD_LABEL, SSD_MOUNT],      # by label, no fstab needed
+        ["mount", SSD_DEVICE_LINK, SSD_MOUNT],      # by device node
+    ]
+    errors = []
+    for cmd in attempts:
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            if os.path.ismount(SSD_MOUNT):
+                return ""
+            msg = (r.stderr or r.stdout or f"exit {r.returncode}").strip()
+            errors.append(f"`{' '.join(cmd)}` -> {msg}")
+        except Exception as e:
+            errors.append(f"`{' '.join(cmd)}` -> {e}")
+    return " | ".join(errors)
+
+
 def wait_for_ssd(timeout: float = SSD_WAIT_S) -> bool:
-    """Return True once the capture SSD is mounted, trying to mount it.
+    """Block until the capture SSD is mounted, mounting it ourselves if needed.
 
     os.path.isdir() is not enough: the mount point is a permanent directory
-    created by prepare_ssd.sh, so it exists whether or not anything is
-    mounted on it. Only os.path.ismount() answers the real question.
+    created by prepare_ssd.sh, so it exists whether or not anything is mounted
+    on it. Only os.path.ismount() answers the real question.
+
+    A USB SSD can enumerate after systemd has passed local-fs.target, in which
+    case the fstab entry is never retried and the disk sits there, healthy and
+    unmounted, forever.
     """
     if os.path.ismount(SSD_MOUNT):
         return True
+
     log.warning(f"{SSD_MOUNT} is not mounted - waiting up to {timeout:.0f}s")
     deadline = time.monotonic() + timeout
+    last_report = 0.0
+    reason = "not started"
+
     while time.monotonic() < deadline:
-        try:
-            subprocess.run(["mount", SSD_MOUNT], check=False,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           timeout=10)
-        except Exception as e:
-            log.debug(f"mount attempt failed: {e}")
         if os.path.ismount(SSD_MOUNT):
-            log.info(f"{SSD_MOUNT} mounted")
+            log.info(f"{SSD_MOUNT} mounted after "
+                     f"{timeout - (deadline - time.monotonic()):.0f}s")
             return True
+
+        if os.path.exists(SSD_DEVICE_LINK):
+            reason = _try_mount() or "mounted"
+            if os.path.ismount(SSD_MOUNT):
+                log.info(f"{SSD_MOUNT} mounted")
+                return True
+        else:
+            reason = (f"{SSD_DEVICE_LINK} does not exist - the SSD has not "
+                      f"enumerated (check the USB port/cable: lsusb, dmesg)")
+
+        remaining = deadline - time.monotonic()
+        if time.monotonic() - last_report >= 10.0:
+            last_report = time.monotonic()
+            log.warning(f"still waiting for SSD ({remaining:.0f}s left): {reason}")
+
         time.sleep(1.0)
+
+    log.error(f"gave up waiting for {SSD_MOUNT} after {timeout:.0f}s: {reason}")
     return False
 
 
