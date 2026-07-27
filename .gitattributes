@@ -1,0 +1,42 @@
+# Line-ending policy for a repository shared between a Windows laptop and 16
+# Raspberry Pis.
+#
+# This matters more than usual here: a .sh file checked out with CRLF fails on
+# the Pi with "\r: command not found", and startup.sh is executed by systemd,
+# so a single stray CR takes the capture service down on every camera.
+
+# Normalise everything git considers text to LF in the index and in the
+# working tree. Rules further down override this for specific types.
+*           text=auto eol=lf
+
+# Executed on the Pi - must be LF, no exceptions.
+*.sh        text eol=lf
+*.service   text eol=lf
+*.py        text eol=lf
+*.yaml      text eol=lf
+*.yml       text eol=lf
+*.ino       text eol=lf
+*.c         text eol=lf
+*.h         text eol=lf
+Makefile    text eol=lf
+
+# Windows-side helpers; CRLF is the native convention there.
+*.ps1       text eol=crlf
+*.bat       text eol=crlf
+*.cmd       text eol=crlf
+
+# Binary - never convert, never diff as text.
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.pdf       binary
+*.npz       binary
+*.npy       binary
+*.ply       binary
+*.3mf       binary
+*.ko        binary
+*.dtbo      binary
+*.so        binary
+*.tar.gz    binary
+*.zip       binary
