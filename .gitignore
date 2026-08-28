@@ -119,6 +119,7 @@ data/
 
 # Data analysis outputs
 collected_data/
+sa_results/
 
 # Packed data outputs
 packed_data/
