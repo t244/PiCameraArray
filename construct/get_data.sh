@@ -257,11 +257,13 @@ latest_session() {    # newest session directory name under the data dir
     ssh_run "$target" "ls -1t '$dir' 2>/dev/null | head -1" | tr -d '\r'
 }
 
-remote_file_count() { # number of .png/.npz below the remote session dir
-    local target="$1" dir="$2" name="$3"
-    ssh_run "$target" \
-        "find '$dir/$name' \\( -name '*.png' -o -name '*.npz' \\) 2>/dev/null | wc -l" \
-        | tr -dc '0-9'
+remote_usage() {  # "files bytes" of the .png/.npz below the remote session dir
+    local target="$1" dir="$2" name="$3" out
+    out="$(ssh_run "$target" \
+        "find '$dir/$name' -type f \\( -name '*.png' -o -name '*.npz' \\) -printf '%s\\n' 2>/dev/null |
+         awk '{c++; b += \$1} END {print c+0, b+0}'")"
+    out="$(printf '%s' "$out" | tr -dc '0-9 ')"
+    [[ -n "$out" ]] && printf '%s\n' "$out" || echo "0 0"
 }
 
 local_file_count() {
@@ -949,9 +951,16 @@ process_pi() {
 
     local dest="$DATA_ROOT/${session:-$rname}/${host}_${rname}"
     local lcount rbytes=0
-    [[ -n "$rcount" ]] || rcount="$(remote_file_count "$target" "$rdir" "$rname")"
-    rcount="${rcount:-0}"
-    [[ -s "$SURVEY_DIR/$host.pick" ]] && rbytes="$(cut -f4 "$SURVEY_DIR/$host.pick")"
+    if [[ -s "$SURVEY_DIR/$host.pick" ]]; then
+        rbytes="$(cut -f4 "$SURVEY_DIR/$host.pick")"
+    fi
+    # Without a survey (--no-check) nobody has asked the Pi yet. Ask now, for
+    # files AND bytes: the byte total is what tells a finished host apart from
+    # one whose files are all present but one of them cut short.
+    if [[ -z "$rcount" || "${rbytes:-0}" -le 0 ]]; then
+        read -r rcount rbytes <<< "$(remote_usage "$target" "$rdir" "$rname")"
+    fi
+    rcount="${rcount:-0}"; rbytes="${rbytes:-0}"
     # tell the progress monitor where to look and what "finished" means here
     printf '%s\t%s\t%s\n' "$dest" "$rcount" "${rbytes:-0}" > "$SURVEY_DIR/$host.expect"
     local lbytes
