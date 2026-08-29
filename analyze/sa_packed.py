@@ -528,7 +528,8 @@ def main():
     ap.add_argument("--calib", type=Path, default=None,
                     help="calibration_results.npz -> homography warp (hook, not implemented)")
     ap.add_argument("--cameras", default=None, help="restrict, e.g. e00,e01,e08,e09")
-    ap.add_argument("--out", type=Path, default=None, help="output directory")
+    ap.add_argument("--out", type=Path, default=None,
+                    help="output directory (default: <packed session>/sa/<burst>)")
     ap.add_argument("--list", action="store_true", help="show the burst and exit")
     args = ap.parse_args()
 
@@ -595,9 +596,13 @@ def main():
     print(f"ref cam : {cam_name(ref)} ({cam_band(ref)}nm)   pitch {args.pitch}mm   "
           f"f {f_px:.0f}px")
 
-    out_dir = args.out or (args.burst if args.burst.is_dir()
-                           else args.burst.parent) / f"sa_{label}"
+    # Results live beside the packed session, not inside the burst: a burst
+    # directory is the set of camera files and stays that way, so re-packing
+    # or re-linking it never has to reason about output that grew in there.
+    session_dir = args.burst.parent if args.burst.is_dir() else args.burst.parent
+    out_dir = args.out or session_dir / "sa" / label
     out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"output  : {out_dir}")
 
     # ---- 5 sweep (optional) ---------------------------------------------
     planes = parse_sweep(args.sweep) if args.sweep else [args.z]
