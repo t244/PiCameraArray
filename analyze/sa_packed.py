@@ -71,6 +71,9 @@ USAGE
     python analyze/sa_packed.py .../burst0042 --sweep 1500:8000:250 --scale 0.5
     python analyze/sa_packed.py .../burst0042 --z 3000 --frame 45 --out sa_out
 
+Results are written to ./output/sa/<pack id>/<burst>/ - relative to where the
+command is run, not into the data tree.
+
 numpy is required. OpenCV is used when present (faster warps and PNG I/O) but
 the script falls back to numpy-only paths, so it runs on a bare Thunder too.
 """
@@ -529,7 +532,8 @@ def main():
                     help="calibration_results.npz -> homography warp (hook, not implemented)")
     ap.add_argument("--cameras", default=None, help="restrict, e.g. e00,e01,e08,e09")
     ap.add_argument("--out", type=Path, default=None,
-                    help="output directory (default: <packed session>/sa/<burst>)")
+                    help="output directory "
+                         "(default: ./output/sa/<pack id>/<burst>)")
     ap.add_argument("--list", action="store_true", help="show the burst and exit")
     args = ap.parse_args()
 
@@ -596,11 +600,14 @@ def main():
     print(f"ref cam : {cam_name(ref)} ({cam_band(ref)}nm)   pitch {args.pitch}mm   "
           f"f {f_px:.0f}px")
 
-    # Results live beside the packed session, not inside the burst: a burst
-    # directory is the set of camera files and stays that way, so re-packing
-    # or re-linking it never has to reason about output that grew in there.
-    session_dir = args.burst.parent if args.burst.is_dir() else args.burst.parent
-    out_dir = args.out or session_dir / "sa" / label
+    # Results go under the directory the command was run from, keyed by the
+    # packed session and the burst. The data tree stays exactly what the
+    # collection and the packer put there - a burst directory is the set of
+    # camera files and nothing else - while results follow the work, so two
+    # experiments on the same burst do not overwrite each other unless they
+    # are run from the same place.
+    pack_id = args.burst.parent.name
+    out_dir = args.out or Path.cwd() / "output" / "sa" / pack_id / label
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"output  : {out_dir}")
 

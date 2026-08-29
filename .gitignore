@@ -134,3 +134,6 @@ collected_data
 
 # Symlink to the packed burst tree on the data disk
 packed_data
+
+# Analysis results written by analyze/*.py next to where they are run
+output/
