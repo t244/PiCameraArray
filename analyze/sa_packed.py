@@ -85,8 +85,10 @@ import ast
 import json
 import struct
 import sys
+import time
 import zipfile
 import zlib
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -450,16 +452,35 @@ def focus_cost(warped: dict, cams_of_band: dict):
 
 
 # -------------------------------------------------------------------- output -
-def to_u8(img: np.ndarray, lo_pct=1.0, hi_pct=99.0):
+def to_u8(img: np.ndarray, lo_pct=1.0, hi_pct=99.0, lo=None, hi=None,
+          return_range=False):
+    """Map to 8 bits, either on this image's own percentiles or a given range.
+
+    A sequence must share one range: recomputing it per frame ties the display
+    to the scene's own brightness and the video flickers, which is precisely
+    what an SA result is meant to let you judge.
+    """
     finite = np.isfinite(img)
     if not finite.any():
-        return np.zeros(img.shape, np.uint8)
-    lo, hi = np.percentile(img[finite], [lo_pct, hi_pct])
+        out = np.zeros(img.shape, np.uint8)
+        return (out, 0.0, 1.0) if return_range else out
+    if lo is None or hi is None:
+        lo, hi = (float(x) for x in np.percentile(img[finite], [lo_pct, hi_pct]))
     if hi <= lo:
         hi = lo + 1.0
     out = np.clip((img - lo) / (hi - lo), 0, 1)
     out[~finite] = 0
-    return (out * 255).astype(np.uint8)
+    out = (out * 255).astype(np.uint8)
+    return (out, lo, hi) if return_range else out
+
+
+def human_time(sec: float):
+    sec = max(0.0, sec)
+    if sec >= 3600:
+        return f"{sec / 3600:.1f}h"
+    if sec >= 60:
+        return f"{sec / 60:.1f}m"
+    return f"{sec:.0f}s"
 
 
 def write_png(path: Path, img_u8: np.ndarray):
@@ -501,10 +522,136 @@ def false_colour(comp: dict):
 
 
 # ----------------------------------------------------------------------- cli -
+def parse_frames(spec, n_frames):
+    """"all" | "45" | "10-70" | "10:70:5" | "1,5,9" -> list of frame indices."""
+    if spec is None:
+        return [n_frames // 2]
+    spec = spec.strip()
+    if spec == "all":
+        return list(range(n_frames))
+    out = []
+    for part in spec.split(","):
+        part = part.strip()
+        if ":" in part:
+            a, b, step = (part.split(":") + ["1"])[:3]
+            out.extend(range(int(a), int(b) + 1, int(step)))
+        elif "-" in part.lstrip("-"):
+            a, b = part.split("-", 1)
+            out.extend(range(int(a), int(b) + 1))
+        elif part:
+            out.append(int(part))
+    return [i for i in sorted(set(out)) if 0 <= i < n_frames]
+
+
 def parse_sweep(spec: str):
     a, b, step = (float(x) for x in spec.split(":"))
     n = int(round((b - a) / step)) + 1
     return [a + k * step for k in range(n)]
+
+
+def encode_video(png_dir: Path, out_path: Path, fps: float):
+    """PNG sequence -> mp4. ffmpeg if it is there, OpenCV otherwise."""
+    import shutil as _sh
+    import subprocess
+    pngs = sorted(png_dir.glob("frame*.png"))
+    if len(pngs) < 2:
+        return None
+    if _sh.which("ffmpeg"):
+        cmd = ["ffmpeg", "-y", "-loglevel", "error",
+               "-framerate", f"{fps:g}",
+               "-pattern_type", "glob", "-i", str(png_dir / "frame*.png"),
+               "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+               "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18",
+               str(out_path)]
+        if subprocess.run(cmd).returncode == 0:
+            return out_path
+        return None
+    if cv2 is None:
+        return None
+    first = cv2.imread(str(pngs[0]), cv2.IMREAD_UNCHANGED)
+    h, w = first.shape[:2]
+    vw = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"),
+                         fps, (w, h), first.ndim == 3)
+    for p in pngs:
+        vw.write(cv2.imread(str(p), cv2.IMREAD_UNCHANGED))
+    vw.release()
+    return out_path
+
+
+def label_tile(img_u8: np.ndarray, text: str):
+    if cv2 is None:
+        return img_u8
+    out = img_u8.copy()
+    if out.ndim == 2:
+        out = np.dstack([out] * 3)
+    cv2.putText(out, text, (12, 34), cv2.FONT_HERSHEY_SIMPLEX, 1.1,
+                (0, 0, 0), 5, cv2.LINE_AA)
+    cv2.putText(out, text, (12, 34), cv2.FONT_HERSHEY_SIMPLEX, 1.1,
+                (255, 255, 255), 2, cv2.LINE_AA)
+    return out
+
+
+def mosaic_2x2(tiles):
+    """Four labelled tiles into one frame; grey where a band is missing."""
+    hs = [t.shape[0] for t in tiles if t is not None]
+    ws = [t.shape[1] for t in tiles if t is not None]
+    h, w = (max(hs), max(ws)) if hs else (16, 16)
+    filled = []
+    for t in tiles:
+        if t is None:
+            t = np.full((h, w, 3), 40, np.uint8)
+        elif t.ndim == 2:
+            t = np.dstack([t] * 3)
+        filled.append(t)
+    return np.vstack([np.hstack(filled[:2]), np.hstack(filled[2:])])
+
+
+def load_all_cameras(cams, idx, scale, pool):
+    """One frame from every camera, in parallel - numpy releases the GIL."""
+    def one(i):
+        path, prefix = cams[i]
+        img, n, meta = load_camera_frame(path, prefix, idx)
+        if scale != 1.0:
+            if cv2 is not None:
+                img = cv2.resize(img, None, fx=scale, fy=scale,
+                                 interpolation=cv2.INTER_AREA)
+            else:
+                step = max(1, int(round(1 / scale)))
+                img = img[::step, ::step]
+        return i, img, n, meta
+
+    futures = [pool.submit(one, i) for i in sorted(cams)]
+    images, metas, n_frames = {}, {}, None
+    for fut in futures:
+        i, img, n, meta = fut.result()
+        images[i], metas[i] = img, meta
+        n_frames = n if n_frames is None else min(n_frames, n)
+    return images, metas, n_frames
+
+
+def process_frame(cams, idx, cams_of_band, ref, z, f_px, pitch, scale,
+                  ksize, calib, pool):
+    """One frame -> {layer name: image}. The whole per-frame pipeline."""
+    images, metas, _ = load_all_cameras(cams, idx, scale, pool)
+    images, gains = band_gain_normalise(images, cams_of_band)
+
+    def warp(i):
+        return i, warp_for_plane(images[i], i, ref, z, f_px, pitch, calib)
+
+    warped, shifts = {}, {}
+    for i, (w, sh) in [f.result() for f in [pool.submit(warp, i) for i in sorted(images)]]:
+        warped[i], shifts[i] = w, sh
+
+    comp, spread, _ = band_composites(warped, cams_of_band)
+    layers = {}
+    for band, img in comp.items():
+        layers[f"band{band}"] = img
+    for band, img in spread.items():
+        layers[f"spread{band}"] = img
+    cross = cross_band_composite(comp, ksize)
+    if cross is not None:
+        layers["crossband"] = cross
+    return layers, comp, gains, shifts
 
 
 def main():
@@ -515,9 +662,18 @@ def main():
     ap.add_argument("--z", type=float, default=3000.0,
                     help="focal plane distance in mm (default 3000)")
     ap.add_argument("--sweep", default=None,
-                    help="scan planes instead: start:stop:step in mm, e.g. 1500:8000:250")
-    ap.add_argument("--frame", type=int, default=None,
-                    help="frame index inside the burst (default: the middle one)")
+                    help="pick the plane first: start:stop:step in mm, e.g. 1500:8000:250")
+    ap.add_argument("--frames", default=None,
+                    help="which frames of the burst: all | 45 | 10-70 | 10:70:5 "
+                         "(default: the middle one)")
+    ap.add_argument("--frame", type=int, default=None, help="alias for --frames N")
+    ap.add_argument("--fps", type=float, default=15.0, help="video frame rate (default 15)")
+    ap.add_argument("--no-video", action="store_true", help="write the PNG sequences only")
+    ap.add_argument("--drop-png", action="store_true",
+                    help="delete each PNG sequence once its video is written "
+                         "(a 90-frame burst is ~2 GB of PNG against ~350 MB of video)")
+    ap.add_argument("--save-npy", action="store_true",
+                    help="also keep the float data (6 MB per layer per frame)")
     ap.add_argument("--ref", default=None,
                     help="reference camera (default: the most central one present)")
     ap.add_argument("--pitch", type=float, default=40.0,
@@ -528,12 +684,16 @@ def main():
                     help="downscale before processing (0.5 = half size)")
     ap.add_argument("--ksize", type=int, default=15,
                     help="window for the local normalisation (default 15)")
+    ap.add_argument("--stretch", choices=("fixed", "per-frame"), default="fixed",
+                    help="8-bit mapping: fixed over the sequence (default, no flicker) "
+                         "or recomputed per frame")
+    ap.add_argument("--workers", type=int, default=0,
+                    help="threads for the per-camera work (default: cameras present)")
     ap.add_argument("--calib", type=Path, default=None,
                     help="calibration_results.npz -> homography warp (hook, not implemented)")
     ap.add_argument("--cameras", default=None, help="restrict, e.g. e00,e01,e08,e09")
     ap.add_argument("--out", type=Path, default=None,
-                    help="output directory "
-                         "(default: ./output/sa/<pack id>/<burst>)")
+                    help="output directory (default: ./output/sa/<pack id>/<burst>)")
     ap.add_argument("--list", action="store_true", help="show the burst and exit")
     args = ap.parse_args()
 
@@ -563,114 +723,152 @@ def main():
         print(f"note    : {thin} have fewer than 2 views; their composite is a "
               f"single view and their spread is undefined")
 
-    # ---- 1 load ----------------------------------------------------------
-    images, nframes, metas = {}, None, {}
-    idx = args.frame
-    for i in sorted(cams):
-        path, prefix = cams[i]
-        probe = 0 if idx is None else idx
-        img, n, meta = load_camera_frame(path, prefix, probe)
-        if idx is None:                                # default: middle of the burst
-            idx = n // 2
-            if idx != probe:
-                img, n, meta = load_camera_frame(path, prefix, idx)
-        nframes = n if nframes is None else min(nframes, n)
-        if args.scale != 1.0:
-            if cv2 is not None:
-                img = cv2.resize(img, None, fx=args.scale, fy=args.scale,
-                                 interpolation=cv2.INTER_AREA)
-            else:
-                s = max(1, int(round(1 / args.scale)))
-                img = img[::s, ::s]
-        images[i] = img
-        metas[i] = meta
-    h, w = next(iter(images.values())).shape
+    workers = args.workers or max(1, len(cams))
+    pool = ThreadPoolExecutor(max_workers=workers)
+
+    # how many frames the burst holds, and which of them to do
+    probe_path, probe_prefix = cams[sorted(cams)[0]]
+    _, n_frames, _ = load_camera_frame(probe_path, probe_prefix, 0)
+    spec = args.frames if args.frames is not None else (
+        str(args.frame) if args.frame is not None else None)
+    frames = parse_frames(spec, n_frames)
+    if not frames:
+        raise SystemExit(f"no frame selected out of {n_frames}")
+
+    ref = int(args.ref[1:]) if args.ref else min(
+        cams, key=lambda i: (cam_rc(i)[0] - 1.5) ** 2 + (cam_rc(i)[1] - 1.5) ** 2)
     f_px = args.fpx * (args.scale if args.scale != 1.0 else 1.0)
-    print(f"frame   : index {idx} of {nframes}, {w}x{h} px"
-          f"{'' if args.scale == 1 else f' (scaled {args.scale})'}")
-
-    # ---- 2 radiometry ----------------------------------------------------
-    images, scales = band_gain_normalise(images, cams_of_band)
-
-    ref = None
-    if args.ref:
-        ref = int(args.ref[1:])
-    else:                                              # most central present camera
-        ref = min(cams, key=lambda i: (cam_rc(i)[0] - 1.5) ** 2 + (cam_rc(i)[1] - 1.5) ** 2)
+    print(f"frames  : {len(frames)} of {n_frames} "
+          f"({frames[0]}..{frames[-1]})   {workers} worker(s)")
     print(f"ref cam : {cam_name(ref)} ({cam_band(ref)}nm)   pitch {args.pitch}mm   "
           f"f {f_px:.0f}px")
 
-    # Results go under the directory the command was run from, keyed by the
-    # packed session and the burst. The data tree stays exactly what the
-    # collection and the packer put there - a burst directory is the set of
-    # camera files and nothing else - while results follow the work, so two
-    # experiments on the same burst do not overwrite each other unless they
-    # are run from the same place.
     pack_id = args.burst.parent.name
     out_dir = args.out or Path.cwd() / "output" / "sa" / pack_id / label
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"output  : {out_dir}")
 
-    # ---- 5 sweep (optional) ---------------------------------------------
-    planes = parse_sweep(args.sweep) if args.sweep else [args.z]
+    # ---- pick the plane once, on the middle frame of the selection --------
     costs = []
-    for z in planes:
-        warped = {}
-        for i in sorted(images):
-            warped[i], _ = warp_for_plane(images[i], i, ref, z, f_px,
-                                          args.pitch, args.calib)
-        c = focus_cost(warped, cams_of_band)
-        costs.append((z, c))
-        if len(planes) > 1:
-            print(f"  z={z:8.1f}mm  within-band IQR {c:10.3f}")
-    best_z = min(costs, key=lambda zc: zc[1])[0]
-    if len(planes) > 1:
-        (out_dir / f"{label}_cost.csv").write_text(
-            "z_mm,within_band_iqr\n" + "".join(f"{z},{c}\n" for z, c in costs))
-        print(f"best plane by band-internal cost: z = {best_z:.1f} mm")
+    z = args.z
+    if args.sweep:
+        probe = frames[len(frames) // 2]
+        images, _, _ = load_all_cameras(cams, probe, args.scale, pool)
+        images, _ = band_gain_normalise(images, cams_of_band)
+        for zz in parse_sweep(args.sweep):
+            warped = {i: warp_for_plane(images[i], i, ref, zz, f_px,
+                                        args.pitch, args.calib)[0] for i in images}
+            c = focus_cost(warped, cams_of_band)
+            costs.append((zz, c))
+            print(f"  z={zz:8.1f}mm  within-band IQR {c:10.3f}")
+        z = min(costs, key=lambda zc: zc[1])[0]
+        print(f"plane   : z = {z:.1f} mm (band-internal cost, frame {probe})")
+        (out_dir / "cost.csv").write_text(
+            "z_mm,within_band_iqr\n" + "".join(f"{a},{b}\n" for a, b in costs))
 
-    # ---- 3 warp + 4 combine at the chosen plane --------------------------
-    warped, shifts = {}, {}
-    for i in sorted(images):
-        warped[i], shifts[i] = warp_for_plane(images[i], i, ref, best_z, f_px,
-                                              args.pitch, args.calib)
-    comp, spread, nviews = band_composites(warped, cams_of_band)
-    cross = cross_band_composite(comp, args.ksize)
+    # ---- the sequence ----------------------------------------------------
+    # One 8-bit mapping for the whole sequence: recomputing it per frame makes
+    # the video flicker with the scene's own brightness, which is exactly the
+    # thing an SA result is meant to let you judge.
+    stretch = {}
+    written = {}
+    t0 = time.time()
+    for n, idx in enumerate(frames, 1):
+        layers, comp, gains, shifts = process_frame(
+            cams, idx, cams_of_band, ref, z, f_px, args.pitch, args.scale,
+            args.ksize, args.calib, pool)
+        fc = false_colour(comp)
+        if fc is not None:
+            layers["falsecolour"] = fc
 
-    for band in sorted(comp):
-        write_png(out_dir / f"{label}_z{best_z:.0f}_band{band}.png", to_u8(comp[band]))
-        write_png(out_dir / f"{label}_z{best_z:.0f}_band{band}_spread.png",
-                  to_u8(spread[band]))
-        np.save(out_dir / f"{label}_z{best_z:.0f}_band{band}.npy", comp[band])
-    if cross is not None:
-        write_png(out_dir / f"{label}_z{best_z:.0f}_crossband.png", to_u8(cross))
-        np.save(out_dir / f"{label}_z{best_z:.0f}_crossband.npy", cross)
-    fc = false_colour(comp)
-    if fc is not None:
-        write_png(out_dir / f"{label}_z{best_z:.0f}_falsecolour.png", fc)
+        for name, img in layers.items():
+            if name == "falsecolour":
+                u8 = img                                  # already 8-bit, per channel
+            else:
+                if args.stretch == "fixed" and name in stretch:
+                    lo, hi = stretch[name]
+                    u8 = to_u8(img, lo=lo, hi=hi)
+                else:
+                    u8, lo, hi = to_u8(img, return_range=True)
+                    stretch.setdefault(name, (lo, hi))
+            d = out_dir / "png" / name
+            d.mkdir(parents=True, exist_ok=True)
+            write_png(d / f"frame{idx:04d}.png", u8)
+            written[name] = written.get(name, 0) + 1
+            if args.save_npy and name != "falsecolour":
+                dn = out_dir / "npy" / name
+                dn.mkdir(parents=True, exist_ok=True)
+                np.save(dn / f"frame{idx:04d}.npy", img)
+
+        # a 2x2 of the bands, so one video shows all four at once
+        tiles = []
+        for band in BANDS:
+            key = f"band{band}"
+            if key in layers:
+                lo, hi = stretch.get(key, (None, None))
+                tiles.append(label_tile(to_u8(layers[key], lo=lo, hi=hi), f"{band}nm"))
+            else:
+                tiles.append(None)
+        d = out_dir / "png" / "bands_mosaic"
+        d.mkdir(parents=True, exist_ok=True)
+        write_png(d / f"frame{idx:04d}.png", mosaic_2x2(tiles))
+        written["bands_mosaic"] = written.get("bands_mosaic", 0) + 1
+
+        if n == 1 or n % 10 == 0 or n == len(frames):
+            el = time.time() - t0
+            print(f"  [{n}/{len(frames)}] frame {idx:04d}   "
+                  f"{el / n:.2f}s/frame   eta {human_time((len(frames) - n) * el / n)}")
+
+    # ---- videos ----------------------------------------------------------
+    videos = []
+    if not args.no_video and len(frames) > 1:
+        (out_dir / "video").mkdir(exist_ok=True)
+        for name in sorted(written):
+            seq = out_dir / "png" / name
+            v = encode_video(seq, out_dir / "video" / f"{name}.mp4", args.fps)
+            if v:
+                videos.append(v.name)
+                if args.drop_png:
+                    for f in seq.glob("frame*.png"):
+                        f.unlink()
+                    seq.rmdir()
+        print(f"videos  : {', '.join(videos) if videos else '(none written)'}")
 
     (out_dir / f"{label}_sa.json").write_text(json.dumps({
         "burst": label,
-        "cameras": [cam_name(i) for i in sorted(images)],
+        "pack_id": pack_id,
+        "cameras": [cam_name(i) for i in sorted(cams)],
         "bands": {str(b): [cam_name(i) for i in cams_of_band[b]] for b in cams_of_band},
-        "frame_index": idx,
-        "z_mm": best_z,
-        "sweep": [{"z_mm": z, "within_band_iqr": c} for z, c in costs],
+        "frames": frames,
+        "n_frames_in_burst": n_frames,
+        "z_mm": z,
+        "sweep": [{"z_mm": a, "within_band_iqr": b} for a, b in costs],
         "reference_camera": cam_name(ref),
         "pitch_mm": args.pitch,
         "f_px": f_px,
         "scale": args.scale,
+        "fps": args.fps,
+        "stretch": {k: [float(v[0]), float(v[1])] for k, v in stretch.items()},
+        "stretch_mode": args.stretch,
         "shift_px": {cam_name(i): list(shifts[i]) for i in shifts},
-        "band_gain_scale": {cam_name(i): scales[i] for i in scales},
+        "band_gain_scale": {cam_name(i): gains[i] for i in gains},
+        "layers": {k: v for k, v in sorted(written.items())},
+        "videos": videos,
         "note": ("composites and spreads are per band; the cross-band image is "
                  "locally normalised structure, not radiometry"),
     }, indent=2))
 
-    print(f"\nwrote {len(list(out_dir.iterdir()))} file(s) to {out_dir}")
-    print("  *_band<nm>.png        per-band composite (median of that band's views)")
-    print("  *_band<nm>_spread.png within-band IQR - high where an occluder sits")
-    print("  *_crossband.png       locally normalised structure across bands")
-    print("  *_falsecolour.png     900/800/750 nm as R/G/B, each stretched alone")
+    pool.shutdown()
+    total = sum(f.stat().st_size for f in out_dir.rglob("*") if f.is_file())
+    print(f"\nwrote {sum(written.values())} image(s) in {len(written)} layer(s), "
+          f"{total / 2**30:.2f} GiB, to {out_dir}")
+    print("  png/band<nm>/          per-band composite (median of that band's views)")
+    print("  png/spread<nm>/        within-band IQR - high where an occluder sits")
+    print("  png/crossband/         locally normalised structure across bands")
+    print("  png/falsecolour/       900/800/750 nm as R/G/B, each stretched alone")
+    print("  png/bands_mosaic/      the four bands side by side")
+    if videos:
+        print("  video/<layer>.mp4      the same sequences as video")
     return 0
 
 
