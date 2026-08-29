@@ -3,25 +3,36 @@
     Push a Pi capture SSD from this Windows machine to Thunder over Tailscale.
 
 .DESCRIPTION
-    The SSDs are ext4, which Windows cannot read on its own, so this script
-    mounts the disk inside WSL2 (read-only) and runs construct/ingest_ssd.sh
-    there. That script decides which collection on Thunder the session belongs
-    to - by FILE COUNT, the same rule get_data.sh uses - creates the directory,
-    rsyncs the files over SSH, and verifies the result. Re-running it copies
-    only what is missing, so an interrupted transfer just needs the same
-    command again.
+    The SSDs are ext4, which Windows cannot read on its own, so the disk is
+    made visible inside WSL2 and construct/ingest_ssd.sh runs there. That
+    script decides which collection on Thunder the session belongs to - by
+    FILE COUNT, the same rule get_data.sh uses - creates the directory,
+    rsyncs the files over SSH and verifies the result. Re-running copies only
+    what is missing, so an interrupted transfer just needs the same command
+    again. Nothing is ever written to the SSD; it is mounted read-only.
 
-    Nothing is ever written to the SSD: it is mounted read-only.
+    Three ways to get the disk into WSL, tried in this order:
 
-    Requirements on this machine:
-      - WSL2 with a distro installed        (wsl --install -d Ubuntu)
-      - rsync inside that distro           (wsl -u root apt install -y rsync)
-      - an Administrator PowerShell        (bare-disk mounting needs it)
-      - Tailscale up, and SSH to Thunder working from either WSL or Windows
+      1. -MountPath        you mounted it yourself; nothing is mounted here
+      2. wsl --mount       the built-in way. NOT available on ARM64 Windows
+                           before build 27653, which is why 3 exists
+      3. usbipd-win        the whole USB device is handed to WSL, which then
+                           mounts the partition normally. Works on ARM64.
+                           Install once:  winget install dorssel.usbipd-win
+
+    Requirements: WSL2 with a distro, rsync inside it, an Administrator
+    PowerShell, Tailscale up, and SSH to Thunder working from WSL or Windows.
 
 .PARAMETER Drive
-    Physical drive number of the SSD (see -ListDisks). Auto-detected when the
-    machine has exactly one removable/USB disk of about 233 GB.
+    Physical drive number for the wsl --mount path (see -ListDisks).
+
+.PARAMETER BusId
+    USB bus id for the usbipd path, e.g. 2-1 (see -ListDisks). Detected
+    automatically when exactly one mass-storage device is attached.
+
+.PARAMETER MountPath
+    A path inside WSL where the SSD is already mounted, e.g. /mnt/ssd.
+    Skips every mounting step.
 
 .PARAMETER Target
     user@host on the far side. Default takatani@thunder (Tailscale MagicDNS);
@@ -31,23 +42,22 @@
     Collection folder on Thunder to merge into, e.g. 20260728_073439. Without
     it the matching collection is worked out from the file count.
 
-.PARAMETER List
-    Show what is on the disk and what would happen, then stop.
-
 .PARAMETER ExtraArgs
-    Anything else is passed straight through to ingest_ssd.sh, e.g.
-    --all-sessions, --source-session, --host, --checksum, --bwlimit 50000.
+    Passed straight through to ingest_ssd.sh: --all-sessions,
+    --source-session, --host, --checksum, --bwlimit 50000, ...
 
 .EXAMPLE
     .\push_ssd.ps1 -ListDisks
     .\push_ssd.ps1 -List                       # inspect, copy nothing
-    .\push_ssd.ps1 -Session 20260728_073439    # push the session of that run
-    .\push_ssd.ps1 -Drive 2 -ExtraArgs '--bwlimit','50000'
+    .\push_ssd.ps1 -Session 20260728_073439 -Yes
+    .\push_ssd.ps1 -MountPath /mnt/ssd -List   # disk already mounted in WSL
 #>
 [CmdletBinding()]
 param(
     [int]      $Drive = -1,
     [int]      $Partition = 1,
+    [string]   $BusId = "",
+    [string]   $MountPath = "",
     [string]   $Target = "takatani@thunder",
     [string]   $Session = "",
     [string]   $DataRoot = "/data/CameraArray",
@@ -62,15 +72,26 @@ param(
 )
 
 # NOT "Stop": with Stop, one line on a native command's stderr - ssh saying
-# "Permanently added 'thunder' to the list of known hosts", wsl printing a
-# notice - becomes a NativeCommandError and kills the run. Every external
-# call below is checked by its exit code instead, which is what actually
-# tells us whether it worked.
+# "Permanently added 'thunder' to the list of known hosts", usbipd printing a
+# notice - becomes a NativeCommandError and kills the run. Every external call
+# below is judged by its exit code instead, which is what actually tells us
+# whether it worked.
 $ErrorActionPreference = "Continue"
 $env:WSL_UTF8 = "1"   # wsl.exe otherwise answers in UTF-16 and mangles parsing
+
 function Info($m) { Write-Host "[push_ssd] $m" -ForegroundColor Cyan }
 function Warn($m) { Write-Host "[push_ssd] $m" -ForegroundColor Yellow }
 function Die($m)  { Write-Host "[push_ssd] $m" -ForegroundColor Red; exit 1 }
+
+function Have($exe) { [bool](Get-Command $exe -ErrorAction SilentlyContinue) }
+
+# Run a command inside the distro and return its stdout, stderr dropped.
+function WslOut([string]$cmd, [switch]$AsRoot) {
+    if ($AsRoot) { $out = wsl.exe -d $Distro -u root -e bash -lc $cmd 2>&1 }
+    else         { $out = wsl.exe -d $Distro       -e bash -lc $cmd 2>&1 }
+    $script:WslExit = $LASTEXITCODE
+    return ($out | ForEach-Object { "$_" -replace "`r", "" })
+}
 
 # ---------------------------------------------------------------- disk listing
 function Get-CandidateDisks {
@@ -79,21 +100,31 @@ function Get-CandidateDisks {
                       @{n = 'SizeGB'; e = { [math]::Round($_.Size / 1GB) } }, OperationalStatus
 }
 
-if ($ForceUnmount) {
-    if ($Drive -lt 0) { Die "-ForceUnmount needs -Drive <Number>" }
-    wsl.exe --unmount "\\.\PHYSICALDRIVE$Drive"
-    exit $LASTEXITCODE
+function Get-UsbDevices {
+    if (-not (Have usbipd)) { return @() }
+    $json = (usbipd state 2>&1) -join "`n"
+    try { return (ConvertFrom-Json $json).Devices } catch { return @() }
 }
 
 if ($ListDisks) {
     Info "disks that are neither boot nor system (the Pi SSD is ~233 GB, USB):"
     Get-CandidateDisks | Format-Table -AutoSize
-    Info "then:  .\push_ssd.ps1 -Drive <Number> -List"
+    $usb = Get-UsbDevices
+    if ($usb) {
+        Info "USB devices usbipd can hand to WSL (use -BusId):"
+        $usb | Select-Object BusId, Description,
+               @{n='State'; e={ if ($_.ClientIPAddress) { "attached to WSL" }
+                                elseif ($_.PersistedGuid) { "shared" } else { "-" } }} |
+            Format-Table -AutoSize
+    } elseif (-not (Have usbipd)) {
+        Info "usbipd-win is not installed; on ARM64 Windows it is the way in:"
+        Info "  winget install --exact dorssel.usbipd-win"
+    }
     exit 0
 }
 
 # ------------------------------------------------------------ prerequisites
-if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) {
+if (-not (Have wsl.exe)) {
     Die "WSL is not installed. The SSD is ext4 and Windows cannot read it without WSL.`n  Install with:  wsl --install -d Ubuntu   (then reboot)"
 }
 # a distro name is a bare token; anything else on that stream is a notice
@@ -101,88 +132,174 @@ $wslDistros = (wsl.exe --list --quiet 2>&1) -replace "`0", "" |
               ForEach-Object { "$_".Trim() } |
               Where-Object { $_ -match '^[A-Za-z0-9._-]+$' }
 if (-not $wslDistros) { Die "WSL has no distro installed. Run:  wsl --install -d Ubuntu" }
-if (-not $Distro) { $Distro = ($wslDistros | Select-Object -First 1).Trim() }
+if (-not $Distro) { $Distro = ($wslDistros | Select-Object -First 1) }
 Info "WSL distro: $Distro"
 
 $admin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()
          ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-if (-not $admin) {
-    Die "mounting a bare disk needs an elevated shell. Re-open PowerShell with 'Run as Administrator'."
+if (-not $admin -and -not $MountPath) {
+    Die "attaching or mounting a disk needs an elevated shell. Re-open PowerShell with 'Run as Administrator'."
 }
 
-# rsync must exist inside the distro; it is what makes the transfer resumable
-wsl.exe -d $Distro -e bash -lc "command -v rsync" 2>&1 | Out-Null
-if ($LASTEXITCODE -ne 0) {
-    Die "rsync is missing inside WSL. Install it with:`n  wsl -d $Distro -u root apt-get update && wsl -d $Distro -u root apt-get install -y rsync"
+if ($ForceUnmount) {
+    if ($Drive -ge 0) { wsl.exe --unmount "\\.\PHYSICALDRIVE$Drive" }
+    if ($BusId)       { usbipd detach --busid $BusId }
+    WslOut "umount /mnt/picam_ssd 2>/dev/null; true" -AsRoot | Out-Null
+    Info "cleaned up"
+    exit 0
 }
 
-# --------------------------------------------------------------- pick the disk
-if ($Drive -lt 0) {
-    $cands = @(Get-CandidateDisks | Where-Object { $_.SizeGB -gt 180 -and $_.SizeGB -lt 300 })
-    if ($cands.Count -eq 1) {
-        $Drive = $cands[0].Number
-        Info "auto-detected disk $Drive : $($cands[0].FriendlyName) ($($cands[0].SizeGB) GB, $($cands[0].BusType))"
-    } else {
-        Info "cannot pick a disk on my own; candidates:"
-        Get-CandidateDisks | Format-Table -AutoSize
-        Die "name it with -Drive <Number>"
-    }
+WslOut "command -v rsync" | Out-Null
+if ($WslExit -ne 0) {
+    Die "rsync is missing inside WSL. Install it with:`n  wsl -d $Distro -u root apt-get update; wsl -d $Distro -u root apt-get install -y rsync"
 }
-
-$devicePath = "\\.\PHYSICALDRIVE$Drive"
-$mountPoint = "/mnt/wsl/PHYSICALDRIVE${Drive}p${Partition}"
 
 # ---------------------------------------------------- where the engine lives
-# ingest_ssd.sh sits next to this file; hand WSL the translated path.
 $engineWin = Join-Path $PSScriptRoot "ingest_ssd.sh"
 if (-not (Test-Path $engineWin)) { Die "ingest_ssd.sh not found next to this script ($PSScriptRoot)" }
 $engineWsl = (wsl.exe -d $Distro -e wslpath -a "$engineWin" 2>&1 | Select-Object -First 1)
 if (-not $engineWsl) { Die "could not translate $engineWin into a WSL path" }
-$engineWsl = $engineWsl.Trim()
+$engineWsl = "$engineWsl".Trim()
 
-# A checkout on the Windows filesystem may carry CRLF line endings, which bash
-# refuses. Copy the engine into the distro with the carriage returns stripped.
+# A checkout on the Windows filesystem carries CRLF line endings for some
+# files; bash refuses those. Stage the engine inside the distro without them.
 $engineRun = "/tmp/picam_ingest_ssd.sh"
-wsl.exe -d $Distro -e bash -lc "tr -d '\r' < '$engineWsl' > $engineRun && chmod +x $engineRun" 2>&1 | Out-Null
-if ($LASTEXITCODE -ne 0) { Die "could not stage ingest_ssd.sh inside WSL" }
+WslOut "tr -d '\r' < '$engineWsl' > $engineRun && chmod +x $engineRun" | Out-Null
+if ($WslExit -ne 0) { Die "could not stage ingest_ssd.sh inside WSL" }
 
 # --------------------------------------------- how WSL should reach Thunder
 # WSL2 sits behind a NAT and does not always see the host's Tailscale network.
-# When it cannot, borrow the Windows ssh.exe as rsync's transport: the traffic
-# then goes out through the host, where Tailscale certainly works.
+# When it cannot, borrow the Windows ssh.exe as rsync's transport: that
+# traffic leaves through the host, where Tailscale certainly works.
+$sshProbe = "ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new $Target true"
 $sshCmd = "ssh"
 Info "checking SSH from WSL to $Target ..."
-wsl.exe -d $Distro -e bash -lc "ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new $Target true" 2>&1 | Out-Null
-if ($LASTEXITCODE -ne 0) {
-    Warn "WSL cannot reach $Target directly (Tailscale is usually not routed into WSL2)."
+WslOut $sshProbe | Out-Null
+if ($WslExit -ne 0) {
+    Warn "WSL cannot reach $Target directly (Tailscale is often not routed into WSL2)."
     $winSsh = "/mnt/c/Windows/System32/OpenSSH/ssh.exe"
-    wsl.exe -d $Distro -e bash -lc "$winSsh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new $Target true" 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) {
+    WslOut "$winSsh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new $Target true" | Out-Null
+    if ($WslExit -ne 0) {
         Die @"
 Neither WSL's ssh nor the Windows ssh.exe could reach $Target.
 Check, on this machine:
-  tailscale status                     # is Thunder listed and online?
-  ssh $Target                          # does a plain SSH session work?
-If SSH asks for a password every time, either copy a key over
-  (ssh-keygen; type `$env:USERPROFILE\.ssh\id_ed25519.pub | ssh $Target 'cat >> .ssh/authorized_keys')
-or rely on Tailscale SSH, which Thunder already has enabled.
+  tailscale status         # is Thunder listed and online?
+  ssh $Target              # does a plain SSH session work?
+Thunder has Tailscale SSH enabled, so no key should be needed from a
+machine on the same tailnet.
 "@
     }
     $sshCmd = $winSsh
-    Info "using the Windows ssh.exe as the transport ($winSsh)"
+    Info "using the Windows ssh.exe as the transport"
 } else {
     Info "WSL reaches $Target directly"
 }
 
-# ------------------------------------------------------------- mount and run
-$mounted = $false
-try {
-    Info "mounting $devicePath partition $Partition read-only into WSL ..."
-    wsl.exe --mount $devicePath --partition $Partition --type ext4 --options "ro" 2>&1 | ForEach-Object { Write-Host "  $_" }
-    if ($LASTEXITCODE -ne 0) {
-        Die "wsl --mount failed. Is the disk still in use by Windows, or already mounted?`n  Try:  wsl --unmount $devicePath"
+# ------------------------------------------------- get the disk into WSL -----
+$cleanupWslMount = ""
+$cleanupBusId    = ""
+$cleanupUmount   = ""
+
+function Mount-ViaWsl {
+    if ($Drive -lt 0) {
+        $cands = @(Get-CandidateDisks | Where-Object { $_.SizeGB -gt 180 -and $_.SizeGB -lt 300 })
+        if ($cands.Count -eq 1) {
+            $script:Drive = $cands[0].Number
+            Info "auto-detected disk $($script:Drive) : $($cands[0].FriendlyName) ($($cands[0].SizeGB) GB, $($cands[0].BusType))"
+        } else { return "" }
     }
-    $mounted = $true
+    $dev = "\\.\PHYSICALDRIVE$Drive"
+    Info "trying wsl --mount $dev partition $Partition (read-only) ..."
+    $out = (wsl.exe --mount $dev --partition $Partition --type ext4 --options "ro" 2>&1) -join "`n"
+    if ($LASTEXITCODE -ne 0) {
+        if ($out -match "WSL_E_WSL_MOUNT_NOT_SUPPORTED") {
+            Warn "wsl --mount is not available on this machine (ARM64 needs Windows build 27653+)."
+        } else {
+            Warn ("wsl --mount failed: " + ($out -replace "`n", " "))
+        }
+        return ""
+    }
+    $script:cleanupWslMount = $dev
+    return "/mnt/wsl/PHYSICALDRIVE${Drive}p${Partition}"
+}
+
+function Mount-ViaUsbIp {
+    if (-not (Have usbipd)) {
+        Warn "usbipd-win is not installed. Install it once with:"
+        Warn "  winget install --exact dorssel.usbipd-win     (then re-open this shell)"
+        return ""
+    }
+    $devs = Get-UsbDevices
+    if ($BusId) {
+        $dev = $devs | Where-Object { $_.BusId -eq $BusId } | Select-Object -First 1
+        if (-not $dev) { Warn "no USB device with bus id $BusId"; return "" }
+    } else {
+        $cand = @($devs | Where-Object { $_.Description -match 'Mass Storage|SSD|Disk|UAS' })
+        if ($cand.Count -ne 1) {
+            Warn "cannot pick the USB disk on my own; run  .\push_ssd.ps1 -ListDisks  and pass -BusId"
+            return ""
+        }
+        $dev = $cand[0]
+        $script:BusId = $dev.BusId
+    }
+    Info "handing USB device $($script:BusId) ($($dev.Description)) to WSL ..."
+    usbipd bind --busid $script:BusId 2>&1 | Out-Null      # no-op when already shared
+    usbipd attach --wsl --busid $script:BusId 2>&1 | ForEach-Object { Write-Host "  $_" }
+    if ($LASTEXITCODE -ne 0) {
+        Warn "usbipd attach failed. Is the device in use by Windows? Try unplugging and replugging it."
+        return ""
+    }
+    $script:cleanupBusId = $script:BusId
+    Start-Sleep -Seconds 3
+
+    # find the ext4 partition that just appeared
+    $part = WslOut "lsblk -rno NAME,FSTYPE,LABEL,SIZE | grep -w ext4 | sort -k4 -h | tail -1" -AsRoot
+    $part = ($part | Where-Object { $_ -ne "" } | Select-Object -First 1)
+    if (-not $part) {
+        Warn "the device is attached but WSL sees no ext4 partition on it."
+        Warn "check with:  wsl -u root -e lsblk -f"
+        Warn "(a WSL kernel without USB storage support would explain it: wsl --update, then retry)"
+        return ""
+    }
+    $name = ($part -split '\s+')[0]
+    Info "found /dev/$name ($part)"
+    WslOut "mkdir -p /mnt/picam_ssd && mount -o ro /dev/$name /mnt/picam_ssd" -AsRoot | Out-Null
+    if ($WslExit -ne 0) { Warn "mounting /dev/$name inside WSL failed"; return "" }
+    $script:cleanupUmount = "/mnt/picam_ssd"
+    return "/mnt/picam_ssd"
+}
+
+try {
+    $srcPath = ""
+    if ($MountPath) {
+        Info "using the path you gave: $MountPath (nothing will be mounted or unmounted)"
+        $srcPath = $MountPath
+    } elseif ($BusId) {
+        $srcPath = Mount-ViaUsbIp
+    } else {
+        $srcPath = Mount-ViaWsl
+        if (-not $srcPath) {
+            Info "falling back to usbipd-win passthrough"
+            $srcPath = Mount-ViaUsbIp
+        }
+    }
+    if (-not $srcPath) {
+        Die @"
+Could not make the SSD readable from WSL.
+
+On ARM64 Windows, 'wsl --mount' needs build 27653 or newer, so the usual
+route is usbipd-win:
+
+  winget install --exact dorssel.usbipd-win     # once, then re-open PowerShell
+  .\construct\push_ssd.ps1 -ListDisks           # note the SSD's bus id
+  .\construct\push_ssd.ps1 -BusId 2-1 -List
+
+If that is not an option, mount the disk in WSL by any means you like and
+point this script at it:
+
+  .\construct\push_ssd.ps1 -MountPath /mnt/ssd -List
+"@
+    }
 
     $engineArgs = @("--target", $Target, "--ssh-cmd", $sshCmd, "--data-root", $DataRoot,
                     "--progress-interval", "$ProgressInterval")
@@ -191,19 +308,18 @@ try {
     if ($DryRun)   { $engineArgs += "--dry-run" }
     if ($Yes)      { $engineArgs += "-y" }
     $engineArgs += $ExtraArgs
-    $engineArgs += $mountPoint
+    $engineArgs += $srcPath
 
     Info ("running: bash $engineRun " + ($engineArgs -join " "))
     Write-Host ""
     wsl.exe -d $Distro -e bash $engineRun @engineArgs
     $rc = $LASTEXITCODE
     Write-Host ""
-    if ($rc -eq 0) { Info "done" } else { Warn "ingest_ssd.sh exited with $rc (see the messages above)" }
+    if ($rc -eq 0) { Info "done" } else { Warn "ingest_ssd.sh exited with $rc (see above)" }
     exit $rc
 }
 finally {
-    if ($mounted) {
-        Info "unmounting $devicePath"
-        wsl.exe --unmount $devicePath 2>&1 | ForEach-Object { Write-Host "  $_" }
-    }
+    if ($cleanupUmount)   { Info "unmounting $cleanupUmount inside WSL"; WslOut "umount '$cleanupUmount'" -AsRoot | Out-Null }
+    if ($cleanupBusId)    { Info "detaching USB device $cleanupBusId";   usbipd detach --busid $cleanupBusId 2>&1 | Out-Null }
+    if ($cleanupWslMount) { Info "unmounting $cleanupWslMount";          wsl.exe --unmount $cleanupWslMount 2>&1 | Out-Null }
 }
