@@ -270,6 +270,16 @@ local_file_count() {
     find "$d" \( -name '*.png' -o -name '*.npz' \) 2>/dev/null | wc -l | tr -dc '0-9'
 }
 
+# local_usage DIR -> "files bytes".  Counting files is not enough to call a
+# host finished: an interrupted rsync leaves a file that exists at its final
+# name but is short, and a count-only check calls that host complete forever.
+local_usage() {
+    local d="$1"
+    [[ -d "$d" ]] || { echo "0 0"; return; }
+    find "$d" -type f \( -name '*.png' -o -name '*.npz' \) -printf '%s\n' 2>/dev/null |
+        awk '{c++; b += $1} END {print c+0, b+0}'
+}
+
 # --------------------------- pre-flight survey -------------------------------
 # Nothing below transfers data. Before a single byte moves it answers:
 #   * which Pis answer at all
@@ -944,12 +954,18 @@ process_pi() {
     [[ -s "$SURVEY_DIR/$host.pick" ]] && rbytes="$(cut -f4 "$SURVEY_DIR/$host.pick")"
     # tell the progress monitor where to look and what "finished" means here
     printf '%s\t%s\t%s\n' "$dest" "$rcount" "${rbytes:-0}" > "$SURVEY_DIR/$host.expect"
-    lcount="$(local_file_count "$dest")"
+    local lbytes
+    read -r lcount lbytes <<< "$(local_usage "$dest")"
 
     if [[ -d "$dest" && "$rcount" -gt 0 && "$rcount" -eq "$lcount" ]]; then
-        log INFO "$host : already complete ($lcount files) -- skipped"
-        echo skipped > "$STATUS_DIR/$host"
-        return 0
+        if [[ "${rbytes:-0}" -le 0 || "$lbytes" -eq "$rbytes" ]]; then
+            log INFO "$host : already complete ($lcount files) -- skipped"
+            echo skipped > "$STATUS_DIR/$host"
+            return 0
+        fi
+        # Same number of files, fewer bytes: one of them was cut short. rsync
+        # sees the size difference and fetches those files again.
+        log WARN "$host : $lcount/$rcount files but $(( rbytes - lbytes )) byte(s) short -- repairing"
     fi
 
     log INFO "$host : syncing $target:$rdir/$rname -> $dest (remote=$rcount local=$lcount)"
@@ -974,7 +990,7 @@ process_pi() {
     done
 
     if (( rc == 0 )); then
-        local after; after="$(local_file_count "$dest")"
+        local after afterbytes; read -r after afterbytes <<< "$(local_usage "$dest")"
         if [[ $DRY_RUN -eq 1 ]]; then
             log INFO "$host : dry-run OK (would sync $rcount file(s))"
             echo ok > "$STATUS_DIR/$host"
@@ -982,8 +998,12 @@ process_pi() {
             log WARN "$host : PARTIAL ($after/$rcount files) -- see $hostlog"
             fail_note "$host partial:$after/$rcount"
             echo partial > "$STATUS_DIR/$host"
+        elif [[ "${rbytes:-0}" -gt 0 && "$afterbytes" -lt "$rbytes" ]]; then
+            log WARN "$host : PARTIAL ($after/$rcount files but $(( rbytes - afterbytes )) byte(s) short) -- see $hostlog"
+            fail_note "$host short-bytes:$afterbytes/$rbytes"
+            echo partial > "$STATUS_DIR/$host"
         else
-            log INFO "$host : OK ($after files)"
+            log INFO "$host : OK ($after files, $(human_bytes "$afterbytes"))"
             echo ok > "$STATUS_DIR/$host"
         fi
     else
