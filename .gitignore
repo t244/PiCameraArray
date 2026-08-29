@@ -131,3 +131,6 @@ comparisons/
 
 # Symlink to the bulk data disk (/data/CameraArray) - never a real directory here
 collected_data
+
+# Symlink to the packed burst tree on the data disk
+packed_data
