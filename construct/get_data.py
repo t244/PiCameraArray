@@ -13,6 +13,7 @@ import os
 import sys
 import platform
 import shutil
+import argparse
 from datetime import datetime
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -26,6 +27,8 @@ SSH_PASSWORD = "pi"
 IS_WINDOWS = platform.system() == "Windows"
 # plink resolves bare hostnames (e00); ssh on Linux needs mDNS (.local)
 HOST_SUFFIX = "" if IS_WINDOWS else ".local"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+COMPATIBILITY_DATA_DIR = PROJECT_ROOT / "collected_data"
 
 
 def pi_host(pi_name):
@@ -42,15 +45,41 @@ def ssh_cmd(pi_name, remote_command):
             pi_host(pi_name), remote_command]
 
 
-def find_base_directory():
-    """Local base directory for collected data."""
-    workspace_root = Path.cwd()
-    local_path = workspace_root / "collected_data"
+def parse_arguments():
+    """Parse local data storage options."""
+    default_dir = (Path("/data/CameraArray") if not IS_WINDOWS
+                   else Path.cwd() / "collected_data")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--output-dir", type=Path, default=default_dir,
+        help=("Local directory where data is stored "
+              f"(default: {default_dir})"))
+    return parser.parse_args()
+
+
+def find_base_directory(output_dir):
+    """Configure and return the local base directory for collected data."""
+    local_path = output_dir.expanduser()
+    if not local_path.is_absolute():
+        local_path = Path.cwd() / local_path
+    local_path = local_path.resolve()
+
+    if not IS_WINDOWS:
+        compatibility_path = COMPATIBILITY_DATA_DIR
+        if compatibility_path.is_symlink():
+            if compatibility_path.resolve() != local_path:
+                compatibility_path.unlink()
+        elif compatibility_path.exists():
+            raise RuntimeError(
+                f"Cannot create compatibility link: {compatibility_path} "
+                "already exists as a directory or file. Move it aside "
+                "before changing the storage location.")
+        if not compatibility_path.exists():
+            compatibility_path.symlink_to(local_path, target_is_directory=True)
+        print(f"Compatibility link: {compatibility_path} -> {local_path}")
+
     print(f"Local collection directory: {local_path}")
     return local_path
-
-
-LOCAL_BASE_DIR = find_base_directory()
 
 
 def run_command(cmd, check=True):
@@ -242,13 +271,20 @@ def check_tools():
 
 def main():
     """Main function to orchestrate data gathering."""
+    args = parse_arguments()
+    try:
+        local_base_dir = find_base_directory(args.output_dir)
+    except (OSError, RuntimeError) as e:
+        print(f"Error configuring local data directory: {e}")
+        sys.exit(1)
+
     print("=" * 70)
     print("PiCameraArray Data Gathering Script")
     print("=" * 70)
     print(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Platform: "
           f"{'Windows (plink/pscp)' if IS_WINDOWS else 'POSIX (sshpass/rsync)'}")
-    print(f"Base directory: {LOCAL_BASE_DIR}\n")
+    print(f"Base directory: {local_base_dir}\n")
 
     check_tools()
 
@@ -264,7 +300,7 @@ def main():
     print(f"  Latest directory on e00: {e00_latest}\n")
 
     # Step 2: Create local collection directory
-    local_collection_dir = LOCAL_BASE_DIR / e00_latest
+    local_collection_dir = local_base_dir / e00_latest
     try:
         local_collection_dir.mkdir(parents=True, exist_ok=True)
         print("Step 2: Created local collection directory")

@@ -128,3 +128,6 @@ comparisons/
 
 # Keep the dashboard despite *.html rule
 !dashboard/dashboard.html
+
+# Symlink to the bulk data disk (/data/CameraArray) - never a real directory here
+collected_data
