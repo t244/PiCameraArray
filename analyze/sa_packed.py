@@ -254,33 +254,68 @@ def band_gain_normalise(images: dict, cams_of_band: dict, percentile=90.0):
     return scaled, scales
 
 
-def local_normalise(img: np.ndarray, ksize: int = 15, eps: float = 1e-3):
+def local_normalise(img: np.ndarray, ksize: int = 15, clip: float = 6.0):
     """Locally zero-mean, unit-contrast - the only form comparable across bands.
 
     Removes any smooth a(x)*I + b(x), which is what an unknown per-band
     reflectance factor looks like over a small window, leaving structure.
+
+    Flat patches - the black border, a saturated highlight - have no local
+    contrast to divide by, so the quotient there is noise over noise. The
+    denominator gets a floor tied to the image's own typical contrast, and the
+    result is clipped: past a few sigma the value carries no structure anyway,
+    and leaving it unbounded lets a handful of pixels dominate every later
+    median and stretch.
     """
     img = img.astype(np.float32)
+    # The warp leaves NaN wherever a view has no data, and those must not be
+    # allowed to contaminate their neighbourhood: average over the valid
+    # samples in the window instead of over the window.
+    valid = np.isfinite(img).astype(np.float64)
+    filled = np.where(valid > 0, img, 0.0).astype(np.float64)
+    n = _box_sum(valid, ksize)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mu = _box_sum(filled, ksize) / n
+        mu2 = _box_sum(filled * filled, ksize) / n
+        sigma = np.sqrt(np.maximum(mu2 - mu * mu, 0.0))
+    empty = n < 0.5
+    mu = mu.astype(np.float32); sigma = sigma.astype(np.float32)
+    mu[empty] = np.nan
+    sigma[empty] = np.nan
+    finite = np.isfinite(sigma)
+    typical = float(np.median(sigma[finite])) if finite.any() else 0.0  # noqa: E501
+    floor = max(0.25 * typical, 1e-6)
+    # A soft denominator rather than a hard floor: sqrt(s^2 + f^2) damps the
+    # patches with no contrast to speak of instead of amplifying their noise,
+    # and stays smooth, so the result does not hinge on the last float bit of
+    # whichever box filter ran.
+    with np.errstate(invalid="ignore"):
+        out = (img - mu) / np.sqrt(sigma * sigma + floor * floor)
+    return np.clip(out, -clip, clip)
+
+
+def _box_sum(img: np.ndarray, k: int):
+    """Sum over a k x k window, edge-reflected. NaN-free input only.
+
+    float64 throughout, in both backends. The variance below is computed as
+    E[x^2] - E[x]^2, and on raw levels of ~10^3 that difference is where
+    float32 loses its last digits: the two moments are large and nearly
+    equal, so the subtraction cancels most of the precision and a smooth
+    surface can come out with a variance of the wrong sign. Sums of 225
+    samples are cheap enough not to economise here.
+
+    numpy's "symmetric" is OpenCV's BORDER_REFLECT (edge value repeated);
+    numpy's "reflect" is BORDER_REFLECT_101. They must match or the two
+    backends disagree along a k/2-wide frame.
+    """
     if cv2 is not None:
-        mu = cv2.boxFilter(img, -1, (ksize, ksize), normalize=True,
-                           borderType=cv2.BORDER_REFLECT)
-        mu2 = cv2.boxFilter(img * img, -1, (ksize, ksize), normalize=True,
-                            borderType=cv2.BORDER_REFLECT)
-    else:
-        mu = _box_np(img, ksize)
-        mu2 = _box_np(img * img, ksize)
-    sigma = np.sqrt(np.maximum(mu2 - mu * mu, 0.0))
-    return (img - mu) / (sigma + eps * (sigma.mean() + 1.0))
-
-
-def _box_np(img: np.ndarray, k: int):
-    """Box filter via an integral image, for when OpenCV is not installed."""
+        return cv2.boxFilter(img.astype(np.float64), cv2.CV_64F, (k, k),
+                             normalize=False, borderType=cv2.BORDER_REFLECT)
     r = k // 2
-    pad = np.pad(img, r, mode="reflect")
+    pad = np.pad(img.astype(np.float64), r, mode="symmetric")
     ii = np.zeros((pad.shape[0] + 1, pad.shape[1] + 1), np.float64)
     ii[1:, 1:] = pad.cumsum(0).cumsum(1)
-    s = ii[k:, k:] - ii[:-k, k:] - ii[k:, :-k] + ii[:-k, :-k]
-    return (s / (k * k)).astype(np.float32)
+    return ii[k:, k:] - ii[:-k, k:] - ii[k:, :-k] + ii[:-k, :-k]
 
 
 # ------------------------------------------------------------------ warping --
@@ -353,7 +388,8 @@ def robust_stats(stack: np.ndarray):
         frac = (pos - lo).astype(np.float32)
         a = np.take_along_axis(srt, lo[None], axis=0)[0]
         b = np.take_along_axis(srt, hi[None], axis=0)[0]
-        return np.where(cnt > 0, a * (1.0 - frac) + b * frac, np.nan)
+        with np.errstate(invalid="ignore"):     # inf * 0 where a pixel has no view
+            return np.where(cnt > 0, a * (1.0 - frac) + b * frac, np.nan)
 
     med = quantile(0.5)
     iqr = np.where(cnt > 1, quantile(0.75) - quantile(0.25), np.nan)
