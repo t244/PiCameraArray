@@ -61,7 +61,12 @@ param(
     [string[]] $ExtraArgs = @()
 )
 
-$ErrorActionPreference = "Stop"
+# NOT "Stop": with Stop, one line on a native command's stderr - ssh saying
+# "Permanently added 'thunder' to the list of known hosts", wsl printing a
+# notice - becomes a NativeCommandError and kills the run. Every external
+# call below is checked by its exit code instead, which is what actually
+# tells us whether it worked.
+$ErrorActionPreference = "Continue"
 $env:WSL_UTF8 = "1"   # wsl.exe otherwise answers in UTF-16 and mangles parsing
 function Info($m) { Write-Host "[push_ssd] $m" -ForegroundColor Cyan }
 function Warn($m) { Write-Host "[push_ssd] $m" -ForegroundColor Yellow }
@@ -91,7 +96,10 @@ if ($ListDisks) {
 if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) {
     Die "WSL is not installed. The SSD is ext4 and Windows cannot read it without WSL.`n  Install with:  wsl --install -d Ubuntu   (then reboot)"
 }
-$wslDistros = (wsl.exe --list --quiet) -replace "`0", "" | Where-Object { $_.Trim() -ne "" }
+# a distro name is a bare token; anything else on that stream is a notice
+$wslDistros = (wsl.exe --list --quiet 2>&1) -replace "`0", "" |
+              ForEach-Object { "$_".Trim() } |
+              Where-Object { $_ -match '^[A-Za-z0-9._-]+$' }
 if (-not $wslDistros) { Die "WSL has no distro installed. Run:  wsl --install -d Ubuntu" }
 if (-not $Distro) { $Distro = ($wslDistros | Select-Object -First 1).Trim() }
 Info "WSL distro: $Distro"
@@ -103,7 +111,7 @@ if (-not $admin) {
 }
 
 # rsync must exist inside the distro; it is what makes the transfer resumable
-$null = wsl.exe -d $Distro -e bash -lc "command -v rsync" 2>$null
+wsl.exe -d $Distro -e bash -lc "command -v rsync" 2>&1 | Out-Null
 if ($LASTEXITCODE -ne 0) {
     Die "rsync is missing inside WSL. Install it with:`n  wsl -d $Distro -u root apt-get update && wsl -d $Distro -u root apt-get install -y rsync"
 }
@@ -128,14 +136,14 @@ $mountPoint = "/mnt/wsl/PHYSICALDRIVE${Drive}p${Partition}"
 # ingest_ssd.sh sits next to this file; hand WSL the translated path.
 $engineWin = Join-Path $PSScriptRoot "ingest_ssd.sh"
 if (-not (Test-Path $engineWin)) { Die "ingest_ssd.sh not found next to this script ($PSScriptRoot)" }
-$engineWsl = (wsl.exe -d $Distro -e wslpath -a "$engineWin")
+$engineWsl = (wsl.exe -d $Distro -e wslpath -a "$engineWin" 2>&1 | Select-Object -First 1)
 if (-not $engineWsl) { Die "could not translate $engineWin into a WSL path" }
 $engineWsl = $engineWsl.Trim()
 
 # A checkout on the Windows filesystem may carry CRLF line endings, which bash
 # refuses. Copy the engine into the distro with the carriage returns stripped.
 $engineRun = "/tmp/picam_ingest_ssd.sh"
-wsl.exe -d $Distro -e bash -lc "tr -d '\r' < '$engineWsl' > $engineRun && chmod +x $engineRun"
+wsl.exe -d $Distro -e bash -lc "tr -d '\r' < '$engineWsl' > $engineRun && chmod +x $engineRun" 2>&1 | Out-Null
 if ($LASTEXITCODE -ne 0) { Die "could not stage ingest_ssd.sh inside WSL" }
 
 # --------------------------------------------- how WSL should reach Thunder
@@ -144,11 +152,11 @@ if ($LASTEXITCODE -ne 0) { Die "could not stage ingest_ssd.sh inside WSL" }
 # then goes out through the host, where Tailscale certainly works.
 $sshCmd = "ssh"
 Info "checking SSH from WSL to $Target ..."
-wsl.exe -d $Distro -e bash -lc "ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new $Target true" 2>$null
+wsl.exe -d $Distro -e bash -lc "ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new $Target true" 2>&1 | Out-Null
 if ($LASTEXITCODE -ne 0) {
     Warn "WSL cannot reach $Target directly (Tailscale is usually not routed into WSL2)."
     $winSsh = "/mnt/c/Windows/System32/OpenSSH/ssh.exe"
-    wsl.exe -d $Distro -e bash -lc "$winSsh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new $Target true" 2>$null
+    wsl.exe -d $Distro -e bash -lc "$winSsh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new $Target true" 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) {
         Die @"
 Neither WSL's ssh nor the Windows ssh.exe could reach $Target.
