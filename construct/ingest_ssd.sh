@@ -25,9 +25,14 @@
 #   - a Pi whose network transfer died half way: ingest tops the directory up,
 #     copying only what is missing.
 #
-# Identity works exactly like get_data.sh: a session is identified by its FILE
-# COUNT, and timestamps only break ties. Name a collection with --session and
-# the matching session on the SSD is found automatically.
+# Identity works like get_data.sh: a session is identified by its FILE COUNT,
+# and timestamps only break ties. With one correction that matters here - a
+# collection that is still filling is SHORT of the disk, not equal to it, so
+# what a collection expects is what its FULLEST camera holds, and a session on
+# the disk qualifies when it holds at least that many. An exact match still
+# wins; otherwise the shortest session that could still be the source is used,
+# and it says so. Name a collection with --session and the matching session on
+# the SSD is found automatically.
 #
 # The source disk is only ever READ - never written to, never deleted from.
 #
@@ -340,11 +345,18 @@ while IFS=$'\t' read -r key a b c d; do
     esac
 done <<< "$SNAP"
 
-collection_count() {   # the per-host file count a collection agrees on
+collection_max() {     # what the most complete camera in a collection holds
+    # This, not the modal count, is the collection's session length. The whole
+    # reason this script exists is that transfers stop half way, so most of a
+    # collection can be short - 20260729_053037 held 14 to 33 files per camera
+    # while the disk had the entire run - and the modal count of a collection
+    # that is still filling says nothing about how long the session was. A
+    # camera that finished does say, and no camera can hold MORE files than
+    # the session it came from.
     local c="$1" k
     for k in "${!DEST_FILES[@]}"; do
         [[ "${k%%/*}" == "$c" ]] && printf '%s\n' "${DEST_FILES[$k]}"
-    done | sort -n | uniq -c | sort -k1,1n -k2,2n | tail -1 | awk '{print $2}'
+    done | sort -n | tail -1
 }
 collections() { printf '%s\n' "${!COLL_SEEN[@]}" | sort -r; }
 
@@ -386,15 +398,48 @@ PLAN=()
 plan_add() { PLAN+=("$1"$'\t'"${S_HOST[$1]}"$'\t'"$2"); }
 
 collection_for() {   # SESSION -> the folder it belongs in, or "" when unclear
-    local s="$1" h="${S_HOST[$s]}" c="${S_COUNT[$s]}" cl hits=()
+    # Every diagnostic here goes to stderr: this function's STDOUT is its
+    # return value, captured by the caller, so a log line on stdout would end
+    # up inside a directory name.
+    #
+    # Three rules, strongest first.
+    #   1 the collection already holds a directory for this host and session.
+    #     Nothing beats that, and it is what tops up an interrupted transfer.
+    #   2 a camera in the collection finished with exactly this many files.
+    #     Two different runs almost never agree on a file count.
+    #   3 the collection is merely COMPATIBLE: every camera in it is short of
+    #     this session, which is what a half-transferred collection looks
+    #     like. Only decisive when exactly one collection qualifies.
+    # Assigned on separate lines on purpose: `local a=$1 b=${X[$a]}` expands
+    # every argument before the builtin runs, so b would read whatever global
+    # `a` happened to hold. It works today only because the caller's loop
+    # variable is also called s.
+    local s="$1"
+    local h="${S_HOST[$s]}" c="${S_COUNT[$s]}" cl m exact=() compat=()
     for cl in $(collections); do
         [[ -n "${DEST_FILES[$cl/${h}_${s}]:-}" ]] && { printf '%s\n' "$cl"; return 0; }
     done
     for cl in $(collections); do
-        [[ "$(collection_count "$cl")" == "$c" ]] && hits+=("$cl")
+        m="$(collection_max "$cl")"; m="${m:-0}"
+        if (( m == c )); then exact+=("$cl")
+        elif (( m < c )); then compat+=("$cl")
+        fi
     done
-    (( ${#hits[@]} == 1 )) && { printf '%s\n' "${hits[0]}"; return 0; }
-    (( ${#hits[@]} > 1 )) && { log WARN "$s : $c files matches several collections: ${hits[*]}"; return 1; }
+    (( ${#exact[@]} == 1 )) && { printf '%s\n' "${exact[0]}"; return 0; }
+    if (( ${#exact[@]} > 1 )); then
+        log WARN "$s : $c files matches several collections exactly: ${exact[*]}" >&2
+        return 1
+    fi
+    if (( ${#compat[@]} == 1 )); then
+        log INFO "$s : nothing at the destination has $c files yet; '${compat[0]}' is the" >&2
+        log INFO "  only collection short enough to be this session (fullest camera: $(collection_max "${compat[0]}"))" >&2
+        printf '%s\n' "${compat[0]}"
+        return 0
+    fi
+    if (( ${#compat[@]} > 1 )); then
+        log WARN "$s : $c files could top up any of: ${compat[*]} -- name one with --session" >&2
+        return 1
+    fi
     [[ -n "${COLL_SEEN[$s]:-}" ]] && { printf '%s\n' "$s"; return 0; }
     return 1
 }
@@ -404,27 +449,50 @@ if [[ -n "$COLLECTION" ]]; then
         (( NEW_COLLECTION == 1 )) || die "collection '$COLLECTION' does not exist under $DATA_ROOT on $(dest_label) (use --new-collection)"
         log INFO "collection '$COLLECTION' will be created"
     fi
-    want="$(collection_count "$COLLECTION")"; want="${want:-0}"
+    want="$(collection_max "$COLLECTION")"; want="${want:-0}"
     if [[ -n "$SOURCE_SESSION" ]]; then
-        if (( want > 0 )) && [[ "${S_COUNT[$SOURCE_SESSION]:-0}" != "$want" ]]; then
-            log WARN "'$SOURCE_SESSION' holds ${S_COUNT[$SOURCE_SESSION]:-0} file(s) but '$COLLECTION' is a $want-file session --"
-            log WARN "  they are almost certainly DIFFERENT runs; continuing because you named it explicitly"
+        if (( want > 0 )) && (( ${S_COUNT[$SOURCE_SESSION]:-0} < want )); then
+            log WARN "'$SOURCE_SESSION' holds ${S_COUNT[$SOURCE_SESSION]:-0} file(s) but a camera in '$COLLECTION' already has $want --"
+            log WARN "  the disk cannot be the source of a longer run, so these are almost certainly"
+            log WARN "  DIFFERENT sessions; continuing because you named it explicitly"
         fi
         plan_add "$SOURCE_SESSION" "$COLLECTION"
     elif (( ALL_SESSIONS == 1 )); then
         for s in "${SESSIONS[@]}"; do plan_add "$s" "$COLLECTION"; done
     else
         (( want > 0 )) || die "collection '$COLLECTION' holds no data yet -- name the session with --source-session"
-        best=""; bestgap=-1
+        # A collection that is still filling is SHORT of the disk, not equal to
+        # it, so the disk's session has to hold at least what the fullest
+        # camera holds. An exact match is the confident case and wins; failing
+        # that, the shortest session that could still be the source wins, and
+        # the timestamp only breaks ties - the same order get_data.sh uses.
+        best=""; bestgap=-1; bestcount=-1; exact=0
         ref="$(session_epoch "$COLLECTION")"
         for s in "${SESSIONS[@]}"; do
-            [[ "${S_COUNT[$s]}" == "$want" ]] || continue
+            c="${S_COUNT[$s]}"
+            (( c >= want )) || continue
             ep="$(session_epoch "$s")"
             gap=$(( ep > ref ? ep - ref : ref - ep ))
-            if (( bestgap < 0 || gap < bestgap )); then best="$s"; bestgap="$gap"; fi
+            if (( c == want )); then
+                (( exact == 1 )) || { best=""; bestgap=-1; }
+                exact=1
+            elif (( exact == 1 )); then
+                continue
+            fi
+            if (( bestcount < 0 || c < bestcount || (c == bestcount && gap < bestgap) )); then
+                best="$s"; bestgap="$gap"; bestcount="$c"
+            fi
         done
-        [[ -n "$best" ]] || die "no session on this disk holds $want files (what '$COLLECTION' expects) -- use --source-session NAME or --all-sessions"
-        log INFO "matched by file count: '$best' ($want files) -> collection '$COLLECTION'"
+        if [[ -z "$best" ]]; then
+            die "no session on this disk holds at least $want files (the fullest camera in '$COLLECTION') -- use --source-session NAME or --all-sessions"
+        fi
+        if (( exact == 1 )); then
+            log INFO "matched by file count: '$best' ($want files) -> collection '$COLLECTION'"
+        else
+            log INFO "'$COLLECTION' is still filling -- its fullest camera has $want file(s)."
+            log INFO "  '$best' ($bestcount files) is the shortest session on the disk that could be its source"
+            log INFO "  -> collection '$COLLECTION'. Use --source-session NAME if that is the wrong one."
+        fi
         plan_add "$best" "$COLLECTION"
     fi
 else

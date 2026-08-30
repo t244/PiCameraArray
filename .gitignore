@@ -137,3 +137,6 @@ packed_data
 
 # Analysis results written by analyze/*.py next to where they are run
 output/
+
+# Test-run outputs kept for inspection
+out/
