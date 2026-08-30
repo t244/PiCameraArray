@@ -103,7 +103,38 @@ function Get-CandidateDisks {
 function Get-UsbDevices {
     if (-not (Have usbipd)) { return @() }
     $json = (usbipd state 2>&1) -join "`n"
-    try { return (ConvertFrom-Json $json).Devices } catch { return @() }
+    try {
+        $devs = (ConvertFrom-Json $json).Devices
+        if ($devs) { return @($devs) }
+    } catch { }
+    # older usbipd, or a build whose state JSON we do not recognise: read the
+    # table it prints instead. Lines look like
+    #   2-1    0480:a202  USB Attached SCSI (UAS) Mass Storage Device   Not shared
+    $rows = @()
+    foreach ($line in (usbipd list 2>&1)) {
+        if ("$line" -match '^\s*(\d+-\d+)\s+([0-9a-fA-F]{4}:[0-9a-fA-F]{4})\s+(.+?)\s{2,}(\S.*)$') {
+            $rows += [pscustomobject]@{
+                BusId = $Matches[1]; VidPid = $Matches[2]
+                Description = $Matches[3].Trim(); StateText = $Matches[4].Trim()
+                ClientIPAddress = $null; PersistedGuid = $null
+            }
+        }
+    }
+    return $rows
+}
+
+function Show-UsbDevices($devs) {
+    if (-not $devs) {
+        Warn "usbipd reports no USB devices at all. Is the service running?  (usbipd list)"
+        return
+    }
+    $devs | Select-Object BusId, Description,
+           @{n = 'State'; e = {
+                 if ($_.ClientIPAddress) { "attached to WSL" }
+                 elseif ($_.PersistedGuid) { "shared" }
+                 elseif ($_.StateText) { $_.StateText }
+                 else { "-" } }} |
+        Format-Table -AutoSize | Out-String -Width 200 | Write-Host
 }
 
 if ($ListDisks) {
@@ -112,10 +143,7 @@ if ($ListDisks) {
     $usb = Get-UsbDevices
     if ($usb) {
         Info "USB devices usbipd can hand to WSL (use -BusId):"
-        $usb | Select-Object BusId, Description,
-               @{n='State'; e={ if ($_.ClientIPAddress) { "attached to WSL" }
-                                elseif ($_.PersistedGuid) { "shared" } else { "-" } }} |
-            Format-Table -AutoSize
+        Show-UsbDevices $usb
     } elseif (-not (Have usbipd)) {
         Info "usbipd-win is not installed; on ARM64 Windows it is the way in:"
         Info "  winget install --exact dorssel.usbipd-win"
@@ -232,11 +260,36 @@ function Mount-ViaUsbIp {
     $devs = Get-UsbDevices
     if ($BusId) {
         $dev = $devs | Where-Object { $_.BusId -eq $BusId } | Select-Object -First 1
-        if (-not $dev) { Warn "no USB device with bus id $BusId"; return "" }
+        if (-not $dev) {
+            Warn "no USB device with bus id $BusId. usbipd sees:"
+            Show-UsbDevices $devs
+            return ""
+        }
     } else {
-        $cand = @($devs | Where-Object { $_.Description -match 'Mass Storage|SSD|Disk|UAS' })
+        # what a mass-storage bridge tends to call itself, plus the drive's own
+        # name as Windows reports it, since some enclosures announce that
+        # Windows names devices in the display language, so the Japanese terms
+        # are here too - as escapes, because a .ps1 without a BOM is read in
+        # the ANSI code page by PowerShell 5.1 and literal kanji would rot.
+        $wanted = 'Mass Storage|UAS|SCSI|SSD|Disk|Storage|External|Portable' +
+                  '|\u5927\u5BB9\u91CF|\u8A18\u61B6\u88C5\u7F6E' +
+                  '|\u30C7\u30A3\u30B9\u30AF|\u30B9\u30C8\u30EC\u30FC\u30B8'
+        $model = ""
+        if ($Drive -ge 0) {
+            $d = Get-Disk -Number $Drive -ErrorAction SilentlyContinue
+            if ($d) { $model = ($d.FriendlyName -split '\s+')[0] }
+        }
+        $cand = @($devs | Where-Object {
+            $_.Description -match $wanted -or ($model -and $_.Description -match [regex]::Escape($model)) })
         if ($cand.Count -ne 1) {
-            Warn "cannot pick the USB disk on my own; run  .\push_ssd.ps1 -ListDisks  and pass -BusId"
+            # one already attached to WSL is unambiguous enough
+            $attached = @($devs | Where-Object { $_.ClientIPAddress })
+            if ($attached.Count -eq 1) { $cand = $attached }
+        }
+        if ($cand.Count -ne 1) {
+            Warn "cannot tell which of these is the SSD; re-run with -BusId <id>:"
+            Show-UsbDevices $devs
+            Warn "example:  .\construct\push_ssd.ps1 -BusId $(if ($devs) { $devs[0].BusId } else { '2-1' }) -List"
             return ""
         }
         $dev = $cand[0]
