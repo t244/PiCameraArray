@@ -191,8 +191,15 @@ def temporal_transmission(stack: np.ndarray, blur: float, quantile: float = 85.0
     the band and 0-4% off the horizontal one. The horizontal family is what
     the four viewpoints are for - their baselines run both ways.
     """
-    env = (stack.max(axis=0) if quantile >= 100 else
-           np.percentile(stack, quantile, axis=0)).astype(np.float32)
+    # np.percentile sorts the whole 21-frame stack per pixel; a partition puts
+    # only the wanted order statistic in place and is the difference between a
+    # sequence taking twenty-five minutes and taking eight.
+    if quantile >= 100:
+        env = stack.max(axis=0)
+    else:
+        k = int(round(quantile / 100.0 * (stack.shape[0] - 1)))
+        env = np.partition(stack, k, axis=0)[k]
+    env = env.astype(np.float32)
     if cv2 is None:
         return np.ones_like(env)
     base = cv2.GaussianBlur(env, (0, 0), blur)
@@ -408,7 +415,8 @@ def separate(views: np.ndarray, blur: float, iters: int = 8, eps: float = 1e-3):
         "unoccluded" means.
     T is clipped to (0, 1].  A fence adds no light.
 
-    Returns (B, T, history of the residual).
+    Returns (B, T, history of the residual). It converges fast: on burst0001
+    the result is identical at one iteration and at eight.
     """
     v = views.shape[0]
     I = np.nan_to_num(views).astype(np.float32)
@@ -565,6 +573,8 @@ def defence_at(raw, band_cams, ref, z, calib, period, target_px, f_px, args,
     warped = {i: S.warp_for_plane(raw[i], i, ref, z, f_px, args.pitch, calib)[0]
               for i in band_cams}
 
+    before = np.array(warped[ref], copy=True)     # for the comparison panels
+
     # ---- 1b the cross-view transmission ------------------------------------
     # Before the matching, not after. The fence is the loudest thing in the
     # frame and it is in a DIFFERENT PLACE in each view, so while it is there
@@ -683,7 +693,7 @@ def defence_at(raw, band_cams, ref, z, calib, period, target_px, f_px, args,
     fam = {n: {"v": fence_excess(im, 1, pv), "h": fence_excess(im, 0, ph)}
            for n, im in (("reference", warped[ref]), ("median", med), ("background", B))}
     res = {"z": z, "B": B, "T": T, "filled": filled, "hole": hole, "median": med,
-           "periods": (pv, ph), "family": fam,
+           "before": before, "periods": (pv, ph), "family": fam,
            "reference": warped[ref], "residual": hist, "flows_rejected": n_bad,
            "fence_ref": fence_share(warped[ref], period),
            "fence_median": fence_share(med, period),
@@ -705,6 +715,32 @@ def defence_at(raw, band_cams, ref, z, calib, period, target_px, f_px, args,
         S.write_png(out / "0_median.png",
                     S.tone_map(S.to_u8(med), args.gamma, args.clahe))
     return res
+
+
+class FrameWindow:
+    """The frames a sliding temporal window needs, loaded once each.
+
+    A 21-frame window recomputed per output frame would read 21 frames per
+    camera per frame - for a 90-frame burst that is 7560 reads of a 178 MB
+    archive. Walking the sequence in order and keeping a ring buffer makes it
+    one read per camera per frame, plus the window to prime it.
+    """
+
+    def __init__(self, load, cams, n):
+        self.load, self.cams, self.n = load, cams, max(1, n)
+        self.buf = {i: {} for i in cams}
+
+    def at(self, i, k, n_frames):
+        """The window centred on k for camera i, clamped to the burst."""
+        lo = max(0, min(k - self.n // 2, n_frames - self.n))
+        want = range(lo, min(lo + self.n, n_frames))
+        b = self.buf[i]
+        for j in want:
+            if j not in b:
+                b[j] = self.load(i, j)
+        for j in [j for j in b if j not in want]:
+            del b[j]
+        return np.stack([b[j] for j in want])
 
 
 def run(args):
@@ -733,7 +769,28 @@ def run(args):
                             interpolation=cv2.INTER_AREA)
         return im
 
-    raw, t_trans = {}, {}
+    probe_path, probe_pre = cams[band_cams[0]]
+    n_frames = S.load_camera_frame(probe_path, probe_pre, 0)[1]
+    spec = args.frames if args.frames else str(args.frame)
+    seq = S.parse_frames(spec, n_frames)
+    if not seq:
+        raise SystemExit(f"no frame selected out of {n_frames}")
+    args.frame = seq[len(seq) // 2]            # the probe decides the settings
+    window = FrameWindow(one_frame, band_cams, args.temporal)
+
+    def views_at(idx):
+        """One instant, gain-matched and with its fence transmission removed."""
+        v = {i: one_frame(i, idx + offsets.get(i, 0)) for i in band_cams}
+        v, _ = S.band_gain_normalise(v, {args.band: band_cams})
+        if args.temporal > 1:
+            for i in band_cams:
+                st = window.at(i, idx + offsets.get(i, 0), n_frames)
+                t = temporal_transmission(st, blur=period * 1.3,
+                                          quantile=args.temporal_q)
+                v[i] = v[i] / t
+        return v
+
+    raw = {}
     for i in band_cams:
         raw[i] = one_frame(i, args.frame + offsets.get(i, 0))
     raw, _ = S.band_gain_normalise(raw, {args.band: band_cams})
@@ -747,16 +804,9 @@ def run(args):
     per_share = float(max(est)[0])
 
     if args.temporal > 1:
-        # Per view, in the camera's own frame, before anything is warped.
-        n = args.temporal
-        per0 = period
-        for i in band_cams:
-            k0 = args.frame + offsets.get(i, 0) - n // 2
-            st = np.stack([one_frame(i, k) for k in range(max(0, k0), max(0, k0) + n)])
-            t_trans[i] = temporal_transmission(st, blur=per0 * 1.3, quantile=args.temporal_q)
-            raw[i] = raw[i] / t_trans[i]
-        print(f"temporal: {n} frames, {args.temporal_q:.0f}th percentile, "
-              f"blur {per0*1.3:.0f}px -- fence transmission taken out per view")
+        print(f"temporal: {args.temporal} frames, {args.temporal_q:.0f}th percentile, "
+              f"blur {period*1.3:.0f}px -- fence transmission taken out per view")
+        raw = views_at(args.frame)
     f_px = args.fpx * args.scale
 
     clear = {i: view_masks(raw[i], period)[1].mean() for i in band_cams}
@@ -769,7 +819,82 @@ def run(args):
     print(f"scene   : fence period {period:.1f}px ({per_share*100:.0f}% of the band "
           f"as captured), target {target_px:.0f}px at {args.z:.0f}mm")
 
-    if not args.sweep:
+    if len(seq) > 1:
+        # ---- the sequence ---------------------------------------------------
+        # One 8-bit mapping for the whole run, taken from the probe frame:
+        # recomputing it per frame ties the display to the scene's own
+        # brightness and the video flickers, which is the thing a de-fenced
+        # sequence exists to let you judge.
+        print(f"frames  : {len(seq)} of {n_frames} ({seq[0]}..{seq[-1]})")
+        probe = defence_at(raw, band_cams, ref, args.z, calib, period, target_px,
+                           f_px, args, out=out, verbose=True)
+
+        def plain_at(idx):
+            """The same instant with no transmissions taken out at all - what a
+            camera and a plain median actually give, which is what the result
+            has to be compared against."""
+            v = {i: one_frame(i, idx + offsets.get(i, 0)) for i in band_cams}
+            v, _ = S.band_gain_normalise(v, {args.band: band_cams})
+            w = {i: S.warp_for_plane(v[i], i, ref, args.z, f_px, args.pitch, calib)[0]
+                 for i in band_cams}
+            return w[ref], S.robust_stats(np.stack([w[i] for i in band_cams]))[0]
+
+        # One 8-bit range for the whole run, pooled over frames spread across it:
+        # the drum's illumination sweeps, so a range taken from one frame leaves
+        # a third of the sequence nearly black.
+        rng = {}
+        sample = [seq[k] for k in np.linspace(0, len(seq) - 1, min(6, len(seq))).astype(int)]
+        pools = {"defenced": [], "reference": [], "median": []}
+        for idx in sample:
+            r = (probe if idx == args.frame else
+                 defence_at(views_at(idx), band_cams, ref, args.z, calib, period,
+                            target_px, f_px, args, out=None, verbose=False))
+            pr, pm = plain_at(idx)
+            pools["defenced"].append(r["filled"])
+            pools["reference"].append(pr)
+            pools["median"].append(pm)
+        for name, ims in pools.items():
+            v = np.concatenate([np.nan_to_num(im).ravel()[::17] for im in ims])
+            rng[name] = tuple(float(x) for x in np.percentile(v, [1.0, 99.0]))
+        counts, t0 = {}, time.time()
+        for n, idx in enumerate(seq, 1):
+            r = (probe if idx == args.frame else
+                 defence_at(views_at(idx), band_cams, ref, args.z, calib, period,
+                            target_px, f_px, args, out=None, verbose=False))
+            pr, pm = plain_at(idx)
+            tiles = {}
+            for name, im in (("defenced", r["filled"]), ("median", pm),
+                             ("reference", pr)):
+                lo, hi = rng[name]
+                u8 = S.tone_map(S.to_u8(im, lo=lo, hi=hi), args.gamma, args.clahe)
+                d = out / "png" / name
+                d.mkdir(parents=True, exist_ok=True)
+                S.write_png(d / f"frame{idx:04d}.png", u8)
+                counts[name] = counts.get(name, 0) + 1
+                tiles[name] = u8
+            # the three side by side, which is the comparison worth watching
+            side = np.hstack([S.label_tile(tiles[k], t) for k, t in
+                              (("reference", "one camera"), ("median", "median of four"),
+                               ("defenced", "de-fenced"))])
+            d = out / "png" / "compare"
+            d.mkdir(parents=True, exist_ok=True)
+            S.write_png(d / f"frame{idx:04d}.png", side)
+            counts["compare"] = counts.get("compare", 0) + 1
+            if n == 1 or n % 10 == 0 or n == len(seq):
+                el = time.time() - t0
+                print(f"  [{n}/{len(seq)}] frame {idx:04d}   {el/n:.2f}s/frame   "
+                      f"eta {S.human_time((len(seq)-n) * el / n)}")
+        vids = []
+        if not args.no_video:
+            (out / "video").mkdir(exist_ok=True)
+            for name in sorted(counts):
+                v = S.encode_video(out / "png" / name, out / "video" / f"{name}.mp4",
+                                   args.fps)
+                if v:
+                    vids.append(v.name)
+            print(f"videos  : {', '.join(vids) if vids else '(none written)'}")
+        best = probe
+    elif not args.sweep:
         res = defence_at(raw, band_cams, ref, args.z, calib, period, target_px,
                          f_px, args, out=out)
         best = res
@@ -846,6 +971,13 @@ def main():
     ap.add_argument("--band", type=int, default=800, choices=S.BANDS)
     ap.add_argument("--z", type=float, default=550.0, help="focus plane, mm")
     ap.add_argument("--frame", type=int, default=45)
+    ap.add_argument("--frames", default=None,
+                    help="a sequence instead of one frame: all | 10-70 | 10:70:5. "
+                         "Writes a png per frame per layer and an mp4 of each, plus a "
+                         "'compare' strip of one camera, the median and the result")
+    ap.add_argument("--fps", type=float, default=15.0)
+    ap.add_argument("--no-video", action="store_true",
+                    help="write the png sequences only")
     ap.add_argument("--calib", type=Path, default=None)
     ap.add_argument("--offsets", nargs="?", const="auto", default=None)
     ap.add_argument("--ref", type=int, default=-1, help="reference camera index")
@@ -885,7 +1017,10 @@ def main():
     ap.add_argument("--force-flow", action="store_true",
                     help="warp by the local flow even when it fails the two-radius "
                          "test. For looking at what it would have done")
-    ap.add_argument("--iters", type=int, default=8)
+    ap.add_argument("--iters", type=int, default=3,
+                    help="alternating least squares iterations (default 3). It converges "
+                         "in one on burst0001 - the fence excess is identical at 1 and at "
+                         "8 - so this is margin, not need")
     ap.add_argument("--t-blur", type=float, default=0.12,
                     help="transmission smoothing, in fence periods (default 0.12). "
                          "Anything approaching 0.3 removes the fence from T and puts "
