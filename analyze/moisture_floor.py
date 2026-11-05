@@ -82,11 +82,22 @@ def levels(rows, source, stat, frames=None, cams=None, every=1):
     return np.array(t), np.array(L).T
 
 
-def directions(mu):
+def directions(mu, extra=()):
+    """-> (unit water direction, its size, null basis, water size left after extra).
+
+    `extra` are further nuisance directions (the lamp's colour drift). They are
+    removed from the null plane, and the water's sensitivity is reported as the
+    part of it the nuisances cannot imitate.
+    """
     c = mu - mu.mean()
     sens = np.linalg.norm(c)
-    q, _ = np.linalg.qr(np.c_[np.ones(4), c, np.eye(4)])
-    return c / sens, sens, q[:, 2:4]
+    k = 2 + len(extra)
+    q, _ = np.linalg.qr(np.column_stack([np.ones(4), c, *extra, np.eye(4)]))
+    sens_left = sens
+    if extra:
+        qe, _ = np.linalg.qr(np.column_stack([np.ones(4), *extra]))
+        sens_left = float(np.linalg.norm(c - qe @ (qe.T @ c)))
+    return c / sens, sens, q[:, k:4], sens_left
 
 
 def running_median(t, x, minutes):
@@ -102,14 +113,14 @@ def window_mean(t, x, minutes):
     return np.array([x[idx == i].mean() for i in np.unique(idx) if (idx == i).sum() >= 2])
 
 
-def floor(t, L, mu, slow_min=30.0, windows=(0, 30, 120)):
-    u, sens, N = directions(mu)
+def floor(t, L, mu, slow_min=30.0, windows=(0, 30, 120), extra=()):
+    u, sens, N, sens_left = directions(mu, extra)
     X = L - L.mean(1, keepdims=True)
     X = X - X.mean(0, keepdims=True)
     z = N.T @ X                                     # 2 x T
     sm = np.array([running_median(t, zi, slow_min) for zi in z])
     fast = z - sm
-    out = {"n": int(len(t)), "sens": float(sens),
+    out = {"n": int(len(t)), "sens": float(sens), "sens_left": sens_left,
            "sigma": float(np.sqrt(z.var(1).mean())),
            "fast": float(np.sqrt(fast.var(1).mean())),
            "slow": float(np.sqrt(sm.var(1).mean()))}
@@ -170,6 +181,12 @@ def main():
             fl.update(r_water=corr(w, m), r_null=max(abs(corr(zi, m)) for zi in z))
             res["configs"][name] = fl
 
+        # the lamp's colour drift as a nuisance: what is left of the floor, and
+        # of the water, once it is removed too
+        planck = np.array([0.0] + [fin["lamp"]["planck"][b] for b in BANDS[1:]])
+        t, L = levels(rows, "warp", "p95")
+        res["lamp_removed"] = floor(t, L, mu, args.slow_min, extra=(planck,))[0]
+
         for st in STATS:
             t, L = levels(rows, "warp", st)
             res["stats"][st] = floor(t, L, mu, args.slow_min)[0]
@@ -195,6 +212,9 @@ def main():
             print(f"  {name:26s} sigma {fl['sigma']*100:5.2f}%  fast {fl['fast']*100:5.2f}%  "
                   f"slow {fl['slow']*100:5.2f}%  @2h {fl['sigma@120min']*100:5.2f}%  "
                   f"r_water {fl['r_water']:+.2f}  |r_null| {fl['r_null']:.2f}")
+        lr = res["lamp_removed"]
+        print(f"  lamp removed too: sigma {lr['sigma']*100:.2f}%  slow {lr['slow']*100:.2f}%  "
+              f"water sensitivity {lr['sens']:.4f} -> {lr['sens_left']:.4f}")
         print("  statistic: " + "  ".join(f"{k} {v['sigma']*100:.2f}%" for k, v in res["stats"].items()))
         print("  sampling : " + "  ".join(f"[{k}] {v['sigma']*100:.2f}%/{v['fast']*100:.2f}%"
                                           for k, v in res["sampling"].items()))
