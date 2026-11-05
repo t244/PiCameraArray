@@ -615,8 +615,22 @@ run_survey() {
         if [[ -n "${ref_count:-}" ]]; then
             ref_src="file count of --session $FORCE_SESSION"
         else
-            ref_count=0
-            log WARN "--session '$FORCE_SESSION' was not found on any host; falling back to the array vote"
+            # Each Pi names its session after its own start, so the collection
+            # name is usually on no host at all. Then the session that STARTED
+            # nearest to it identifies the run - never the array vote, which
+            # with one host is just that host's newest session (that is how
+            # e10's 2026-07-29 run was filed under 20260728_073439).
+            local fe; fe="$(session_epoch "$FORCE_SESSION")"
+            ref_count="$(awk -F'\t' -v fe="$fe" -v w="$MATCH_WINDOW" '
+                $4 > 0 {d = $1 - fe; if (d < 0) d = -d
+                        if (d <= w && (best == "" || d < bd)) {bd = d; best = $4}}
+                END {print best + 0}' "$SURVEY_DIR/all.tsv")"
+            if (( fe > 0 && ref_count > 0 )); then
+                ref_src="file count of the session starting nearest to --session $FORCE_SESSION"
+            else
+                ref_count=0
+                log WARN "--session '$FORCE_SESSION': no host has a session starting within $(human_dur "$MATCH_WINDOW") of it; falling back to the array vote (hosts far from it will be excluded)"
+            fi
         fi
     fi
     if (( ref_count == 0 )); then
@@ -640,6 +654,11 @@ run_survey() {
         while read -r ep; do [[ -n "$ep" ]] && eps+=("$ep"); done \
             < <(cut -f1 "$SURVEY_DIR/all.tsv")
     ref="$(median_of "${eps[@]:-0}")"
+    # a named collection fixes the reference start: GAP is then measured from
+    # it, and a host whose pick is far from it is a different run
+    if [[ -n "$FORCE_SESSION" ]] && (( $(session_epoch "$FORCE_SESSION") > 0 )); then
+        ref="$(session_epoch "$FORCE_SESSION")"
+    fi
 
     # ---- per-host pick ---------------------------------------------------
     declare -A PICK PCOUNT PBYTES PSPAN PGAP PCDIFF
@@ -718,6 +737,15 @@ run_survey() {
             fail_note "$h empty-session (pre-check)"
             excluded=$((excluded + 1))
             continue
+        fi
+        if [[ -n "$FORCE_SESSION" ]] && (( gap_abs > MATCH_WINDOW )); then
+            SURVEY_WARN+=("$h : session '${PICK[$h]}' starts $(human_dur "$gap_abs") from --session $FORCE_SESSION -- a DIFFERENT run")
+            if (( INCLUDE_MISMATCHED == 0 )); then
+                SURVEY_WARN+=("       -> $h EXCLUDED (filing it under $FORCE_SESSION would mix two runs)")
+                fail_note "$h wrong-run (pre-check)"
+                excluded=$((excluded + 1))
+                continue
+            fi
         fi
         (( mismatched == 1 )) && \
             SURVEY_WARN+=("       -> $h INCLUDED anyway (--include-mismatched)")
@@ -944,6 +972,17 @@ process_pi() {
             if [[ "$(ssh_run "$target" "test -d '$rdir/$session' && echo yes")" == "yes" ]]; then
                 rname="$session"
             else
+                # without a survey nothing else checks this: the latest session
+                # may be a later run, and it must not land in this collection
+                local se re gap
+                se="$(session_epoch "$session")"; re="$(session_epoch "$rname")"
+                gap=$(( re > se ? re - se : se - re ))
+                if (( se > 0 && re > 0 && gap > MATCH_WINDOW )); then
+                    log ERROR "$host : its latest session '$rname' starts $(human_dur "$gap") from '$session' -- a different run, skipped"
+                    fail_note "$host wrong-run"
+                    echo failed > "$STATUS_DIR/$host"
+                    return 0
+                fi
                 log WARN "$host : session '$session' absent, using its latest '$rname'"
             fi
         fi
