@@ -562,12 +562,19 @@ def detail(a: np.ndarray):
 
 
 def defence_at(raw, band_cams, ref, z, calib, period, target_px, f_px, args,
-               out=None, verbose=True, fill=True):
+               out=None, verbose=True, fill=True, metric=None):
     """Every stage at one plane. -> dict of images and numbers.
 
     `out` writes the per-stage images; a sweep passes None and keeps only the
     result, because seventeen planes of six stages is a hundred images nobody
     will look at.
+
+    `metric` is (view, vertical period, horizontal period) taken from the views
+    AS CAPTURED. Both halves have to come from outside: the transmissions
+    rewrite the views in place, so a reference read from them is already
+    corrected and the improvement reads as a fraction of itself - and a period
+    measured on them lands on whatever survived, which on 750 and 900 nm was
+    104 px, a frequency the fence is not at.
     """
     say = print if verbose else (lambda *a, **k: None)
     warped = {i: S.warp_for_plane(raw[i], i, ref, z, f_px, args.pitch, calib)[0]
@@ -688,10 +695,10 @@ def defence_at(raw, band_cams, ref, z, calib, period, target_px, f_px, args,
         say("fill    : every pixel had a clear view somewhere; nothing to synthesise")
 
     med = S.robust_stats(stack)[0]
-    pv = fence_period(warped[ref], 1)
-    ph = fence_period(warped[ref], 0)
+    m_ref, pv, ph = (metric if metric else
+                     (before, fence_period(before, 1), fence_period(before, 0)))
     fam = {n: {"v": fence_excess(im, 1, pv), "h": fence_excess(im, 0, ph)}
-           for n, im in (("reference", warped[ref]), ("median", med), ("background", B))}
+           for n, im in (("reference", m_ref), ("median", med), ("background", B))}
     res = {"z": z, "B": B, "T": T, "filled": filled, "hole": hole, "median": med,
            "before": before, "periods": (pv, ph), "family": fam,
            "reference": warped[ref], "residual": hist, "flows_rejected": n_bad,
@@ -756,7 +763,10 @@ def run(args):
                  if args.offsets == "auto" else Path(args.offsets))
         offsets = S.load_offsets(opath, band_cams)[0] if opath.exists() else {}
 
-    out = args.out or Path.cwd() / "output" / "defence" / args.burst.parent.name / label
+    # the band belongs in the path: four of them into one directory is four
+    # runs overwriting each other
+    out = (args.out or Path.cwd() / "output" / "defence" /
+           args.burst.parent.name / label / f"{args.band}nm")
     out.mkdir(parents=True, exist_ok=True)
     print(f"burst   : {label}   band {args.band}nm   views "
           f"{', '.join(S.cam_name(i) for i in band_cams)}")
@@ -794,6 +804,7 @@ def run(args):
     for i in band_cams:
         raw[i] = one_frame(i, args.frame + offsets.get(i, 0))
     raw, _ = S.band_gain_normalise(raw, {args.band: band_cams})
+    plain_views = {i: np.array(raw[i], copy=True) for i in band_cams}
 
     # The fence period is measured HERE, on the views as captured. After the
     # temporal correction the fence line is most of the way gone, which is the
@@ -816,6 +827,11 @@ def run(args):
     f_ref = (calib["cams"][ref]["K"][0, 0] * args.scale
              if calib and ref in calib["cams"] else f_px)
     target_px = args.target_size_mm * f_ref / args.z
+    # the yardstick: the reference view warped to the plane and otherwise
+    # untouched, plus the two bar periods measured on it
+    plain_ref = S.warp_for_plane(plain_views[ref], ref, ref, args.z, f_px,
+                                 args.pitch, calib)[0]
+    metric = (plain_ref, fence_period(plain_ref, 1), fence_period(plain_ref, 0))
     print(f"scene   : fence period {period:.1f}px ({per_share*100:.0f}% of the band "
           f"as captured), target {target_px:.0f}px at {args.z:.0f}mm")
 
@@ -827,7 +843,7 @@ def run(args):
         # sequence exists to let you judge.
         print(f"frames  : {len(seq)} of {n_frames} ({seq[0]}..{seq[-1]})")
         probe = defence_at(raw, band_cams, ref, args.z, calib, period, target_px,
-                           f_px, args, out=out, verbose=True)
+                           f_px, args, out=out, verbose=True, metric=metric)
 
         def plain_at(idx):
             """The same instant with no transmissions taken out at all - what a
@@ -896,7 +912,7 @@ def run(args):
         best = probe
     elif not args.sweep:
         res = defence_at(raw, band_cams, ref, args.z, calib, period, target_px,
-                         f_px, args, out=out)
+                         f_px, args, out=out, metric=metric)
         best = res
     else:
         # Uniform in disparity, not in millimetres, and over the range the
