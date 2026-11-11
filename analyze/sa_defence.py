@@ -888,6 +888,12 @@ def run(args):
                 S.write_png(d / f"frame{idx:04d}.png", u8)
                 counts[name] = counts.get(name, 0) + 1
                 tiles[name] = u8
+                if args.save_float:
+                    # the values before any 8-bit range, so that panels can be shown
+                    # on one shared scale later (the strips below are not)
+                    fd = out / "float"
+                    fd.mkdir(parents=True, exist_ok=True)
+                    np.save(fd / f"{name}_frame{idx:04d}.npy", np.asarray(im, np.float32))
             # the three side by side, which is the comparison worth watching
             side = np.hstack([S.label_tile(tiles[k], t) for k, t in
                               (("reference", "one camera"), ("median", "median of four"),
@@ -992,6 +998,10 @@ def main():
                          "Writes a png per frame per layer and an mp4 of each, plus a "
                          "'compare' strip of one camera, the median and the result")
     ap.add_argument("--fps", type=float, default=15.0)
+    ap.add_argument("--save-float", action="store_true",
+                    help="with --frames: also save each panel as float .npy under float/. The "
+                         "png panels each get their own 8-bit range, so they are not comparable "
+                         "in brightness; these are")
     ap.add_argument("--no-video", action="store_true",
                     help="write the png sequences only")
     ap.add_argument("--calib", type=Path, default=None)
