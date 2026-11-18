@@ -21,7 +21,7 @@ If an Arduino is connected via USB serial (auto-detected), additionally:
 Modes:
   capture: /sys/module/imx296/parameters/trigger_mode = 1
            still configuration, blocking capture_request loop,
-           images saved to SSD (HIKSEMI) or SD fallback
+           images saved to the SSD (HIKSEMI) only - never the SD card
   preview: trigger_mode = 0 (free running)
            video configuration, MJPEG streaming, manual exposure/gain,
            focus metric (variance of Laplacian) computed continuously
@@ -34,6 +34,7 @@ import os
 import sys
 import glob
 import json
+import errno
 import time
 import signal
 import logging
@@ -73,15 +74,17 @@ PREVIEW_HEIGHT = 544
 TRIGGER_MODE_PATH = "/sys/module/imx296/parameters/trigger_mode"
 SSD_MOUNT = "/media/pi/HIKSEMI"
 SSD_LABEL = "HIKSEMI"
-SD_FALLBACK = "/home/pi/PiCameraArray/data"
 
 CAPTURE_WAIT_CHUNK = 1.0     # polling slice; mode-switch latency upper bound
 TRIGGER_TIMEOUT = 600.0      # warn if no trigger for this long
 
-# How long to wait for the capture SSD before giving up and using the SD card.
-# A USB SSD can enumerate after systemd has passed local-fs.target, in which
+# Capture never falls back to the SD card: a session without the SSD is a
+# setup error, and the SD card would fill (and take the OS down) within the
+# hour. So capture waits for the SSD indefinitely, retrying the mount itself -
+# a USB SSD can enumerate after systemd has passed local-fs.target, in which
 # case the fstab entry is never retried and the disk sits there unmounted.
-SSD_WAIT_S = 120.0
+SSD_WAIT_S = None            # None = wait forever
+SSD_WAIT_REPORT_S = 60.0     # log interval while waiting (10 s for the 1st min)
 
 # Burst buffering: frames are accumulated in RAM during a trigger burst
 # and flushed to disk (npz) in the idle time between bursts.
@@ -92,7 +95,13 @@ CAPTURE_BUFFER_COUNT = 16    # camera driver buffers for burst capture
 # Save the 10-bit packed raw stream (linear, no gamma/ALSC/denoise) for
 # spectral measurements. False = save the 8-bit Y plane instead.
 CAPTURE_RAW = True
-MAX_STORAGE_PERCENT = 95.0
+
+# Stop capturing before the SSD fills: a write that hits ENOSPC leaves a
+# truncated npz behind. ~5 GB is ~40 bursts at 30 fps x 2 s raw. Capture
+# stays stopped until the agent restarts (next power-on), and a new session
+# does not start at all while free space is below this.
+MIN_FREE_GB = 5.0
+WRITE_MARGIN_GB = 1.0        # extra headroom required for each single write
 
 # Halt capture when the CPU gets too hot. Off by default: the Pi already
 # throttles itself in hardware at 80/85 C, and losing an unattended field
@@ -151,6 +160,33 @@ def get_storage_free_gb(path: str) -> float:
         return 0.0
 
 
+# ==================== PILOT LAMP ====================
+
+# States the operator on site should be able to tell apart at a glance.
+PILOT_WAITING_SSD = "waiting_ssd"    # SSD not mounted yet - capture held
+PILOT_RECORDING = "recording"        # session open on the SSD
+PILOT_STORAGE_FULL = "storage_full"  # stopped: SSD below MIN_FREE_GB
+PILOT_ERROR = "error"                # stopped for another reason
+
+_pilot_state = None
+
+
+def indicate(state: str):
+    """Show the agent state on a pilot lamp.
+
+    TODO: drive real hardware. Until then this only logs state changes.
+    Options on a Pi 4 without extra parts: the on-board ACT (green) and PWR
+    (red) LEDs, via /sys/class/leds/{ACT,PWR}/trigger = "none"/"timer" and
+    .../brightness (dtparam=act_led_trigger=none in config.txt keeps the
+    kernel from taking ACT back). Otherwise a GPIO LED per Pi.
+    """
+    global _pilot_state
+    if state == _pilot_state:
+        return
+    log.info(f"pilot lamp: {_pilot_state} -> {state}")
+    _pilot_state = state
+
+
 SSD_DEVICE_LINK = f"/dev/disk/by-label/{SSD_LABEL}"
 
 
@@ -158,7 +194,7 @@ def _try_mount() -> str:
     """Try every reasonable way to mount the SSD.
 
     Returns "" on success, otherwise the collected error text. Never hide the
-    error: a silent failure here is what sends a whole session to the SD card.
+    error: a silent failure here is what holds a session back unnoticed.
     """
     attempts = [
         ["mount", SSD_MOUNT],                       # via /etc/fstab
@@ -178,8 +214,10 @@ def _try_mount() -> str:
     return " | ".join(errors)
 
 
-def wait_for_ssd(timeout: float = SSD_WAIT_S) -> bool:
+def wait_for_ssd(timeout=SSD_WAIT_S) -> bool:
     """Block until the capture SSD is mounted, mounting it ourselves if needed.
+
+    timeout=None waits forever (the default: capture never uses the SD card).
 
     os.path.isdir() is not enough: the mount point is a permanent directory
     created by prepare_ssd.sh, so it exists whether or not anything is mounted
@@ -192,30 +230,33 @@ def wait_for_ssd(timeout: float = SSD_WAIT_S) -> bool:
     if os.path.ismount(SSD_MOUNT):
         return True
 
-    log.warning(f"{SSD_MOUNT} is not mounted - waiting up to {timeout:.0f}s")
-    deadline = time.monotonic() + timeout
+    indicate(PILOT_WAITING_SSD)
+    limit = "indefinitely" if timeout is None else f"up to {timeout:.0f}s"
+    log.warning(f"{SSD_MOUNT} is not mounted - waiting {limit}")
+    t0 = time.monotonic()
     last_report = 0.0
     reason = "not started"
 
-    while time.monotonic() < deadline:
+    while timeout is None or time.monotonic() - t0 < timeout:
         if os.path.ismount(SSD_MOUNT):
-            log.info(f"{SSD_MOUNT} mounted after "
-                     f"{timeout - (deadline - time.monotonic()):.0f}s")
+            log.info(f"{SSD_MOUNT} mounted after {time.monotonic() - t0:.0f}s")
             return True
 
         if os.path.exists(SSD_DEVICE_LINK):
             reason = _try_mount() or "mounted"
             if os.path.ismount(SSD_MOUNT):
-                log.info(f"{SSD_MOUNT} mounted")
+                log.info(f"{SSD_MOUNT} mounted after "
+                         f"{time.monotonic() - t0:.0f}s")
                 return True
         else:
             reason = (f"{SSD_DEVICE_LINK} does not exist - the SSD has not "
                       f"enumerated (check the USB port/cable: lsusb, dmesg)")
 
-        remaining = deadline - time.monotonic()
-        if time.monotonic() - last_report >= 10.0:
+        waited = time.monotonic() - t0
+        interval = 10.0 if waited < 60.0 else SSD_WAIT_REPORT_S
+        if time.monotonic() - last_report >= interval:
             last_report = time.monotonic()
-            log.warning(f"still waiting for SSD ({remaining:.0f}s left): {reason}")
+            log.warning(f"still waiting for SSD ({waited:.0f}s): {reason}")
 
         time.sleep(1.0)
 
@@ -224,26 +265,18 @@ def wait_for_ssd(timeout: float = SSD_WAIT_S) -> bool:
 
 
 def make_session_dir() -> str:
-    """Pick where this capture session writes, preferring the SSD.
+    """Create this capture session's directory on the SSD.
 
-    Falling back to the SD card is almost never what we want: at the default
-    30 fps x 3 s burst every 60 s each camera writes ~178 MB per burst, so a
-    typical card fills in well under an hour. Make the fallback loud.
+    Blocks until the SSD is mounted. There is deliberately no SD-card
+    fallback: at 30 fps raw each camera writes ~120 MB per burst, so the card
+    would fill within the hour and could take the OS down with it.
     """
+    wait_for_ssd()
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    if wait_for_ssd():
-        path = f"{SSD_MOUNT}/data/{ts}"
-        log.info(f"recording to SSD: {path} "
-                 f"({get_storage_free_gb(SSD_MOUNT):.0f} GB free)")
-    else:
-        path = f"{SD_FALLBACK}/{ts}"
-        log.error("=" * 64)
-        log.error("SSD NOT AVAILABLE - falling back to the SD card.")
-        log.error("At default settings the SD card fills in under an hour.")
-        log.error(f"Recording to {path} "
-                  f"({get_storage_free_gb(SD_FALLBACK):.0f} GB free)")
-        log.error("=" * 64)
+    path = f"{SSD_MOUNT}/data/{ts}"
     os.makedirs(path, exist_ok=True)
+    log.info(f"recording to SSD: {path} "
+             f"({get_storage_free_gb(SSD_MOUNT):.0f} GB free)")
     return path
 
 
@@ -423,6 +456,12 @@ class CameraManager:
         self._close_camera()
         set_trigger_mode(True)
         self.session_dir = make_session_dir()
+        free_gb = get_storage_free_gb(self.session_dir)
+        if free_gb < MIN_FREE_GB:
+            log.error(f"SSD has only {free_gb:.1f} GB free "
+                      f"(< {MIN_FREE_GB:.0f} GB) - not starting capture")
+            self.healthy = False
+            indicate(PILOT_STORAGE_FULL)
         self.capture_count = 0
         self.burst_count = 0
         self._burst_frames = []
@@ -455,6 +494,8 @@ class CameraManager:
         self.picam2.start()
         time.sleep(2)
         self.mode = self.MODE_CAPTURE
+        if self.healthy:
+            indicate(PILOT_RECORDING)
         log.info(f"CAPTURE mode - waiting for triggers, saving to {self.session_dir}")
 
     def enter_preview(self):
@@ -611,20 +652,48 @@ class CameraManager:
             self._update_thumbnail(self._last_y_small)
         self._health_check()
 
+    def _stop_for_storage(self, free_gb: float):
+        if self.healthy:
+            log.error(f"SSD nearly full ({free_gb:.1f} GB free, minimum "
+                      f"{MIN_FREE_GB:.0f} GB) - capture stopped until restart")
+        self.healthy = False
+        indicate(PILOT_STORAGE_FULL)
+
     def _writer_loop(self):
-        """Background thread: write queued bursts to disk."""
+        """Background thread: write queued bursts to disk.
+
+        Checks the free space before every write: a write that runs out of
+        space mid-file leaves a truncated npz that looks like data. Such a
+        partial file is removed if it happens anyway.
+        """
         while True:
             path, arrays = self._writer_queue.get()
             try:
-                t0 = time.monotonic()
-                np.savez(path, **arrays)
                 nbytes = sum(a.nbytes for a in arrays.values()
                              if isinstance(a, np.ndarray))
+                free_gb = get_storage_free_gb(os.path.dirname(path))
+                if free_gb < nbytes / 1e9 + WRITE_MARGIN_GB:
+                    log.error(f"Not enough space for {os.path.basename(path)}"
+                              f" ({nbytes / 1e6:.0f} MB, {free_gb:.1f} GB "
+                              f"free) - burst dropped")
+                    self._stop_for_storage(free_gb)
+                    continue
+                t0 = time.monotonic()
+                np.savez(path, **arrays)
                 log.info(f"Saved {os.path.basename(path)} "
                          f"({nbytes / 1e6:.0f} MB "
                          f"in {time.monotonic() - t0:.1f}s)")
             except Exception as e:
                 log.error(f"Write failed for {path}: {e}")
+                if os.path.exists(path):
+                    try:
+                        os.remove(path)
+                        log.error(f"removed partial file {path}")
+                    except OSError as e2:
+                        log.error(f"could not remove partial file: {e2}")
+                if isinstance(e, OSError) and e.errno == errno.ENOSPC:
+                    self._stop_for_storage(get_storage_free_gb(
+                        os.path.dirname(path)))
             finally:
                 self._writer_queue.task_done()
 
@@ -642,10 +711,9 @@ class CameraManager:
             log.debug(f"thumbnail failed: {e}")
 
     def _health_check(self):
-        usage = get_storage_usage(self.session_dir)
-        if usage > MAX_STORAGE_PERCENT:
-            log.error(f"Storage limit exceeded: {usage:.1f}%")
-            self.healthy = False
+        free_gb = get_storage_free_gb(self.session_dir)
+        if free_gb < MIN_FREE_GB:
+            self._stop_for_storage(free_gb)
         temp = get_cpu_temp()
         if temp is not None:
             if temp > MAX_TEMPERATURE:
@@ -653,6 +721,7 @@ class CameraManager:
                     log.critical(f"Critical temperature: {temp}°C "
                                  f"- stopping capture (THERMAL_SHUTDOWN)")
                     self.healthy = False
+                    indicate(PILOT_ERROR)
                 else:
                     log.critical(f"Critical temperature: {temp}°C "
                                  f"- continuing, thermal shutdown is disabled")
@@ -672,12 +741,11 @@ class CameraManager:
             "last_capture_time": self.last_capture_time,
             "session_dir": self.session_dir,
             "storage_usage": round(
-                get_storage_usage(self.session_dir or SD_FALLBACK), 1),
-            # Distinguishes "3% used" on a 250 GB SSD from "3% used" on the
-            # SD card, which the dashboard otherwise renders identically.
+                get_storage_usage(self.session_dir or SSD_MOUNT), 1),
+            # False while still waiting for the SSD (no SD fallback any more).
             "on_ssd": session_on_ssd(self.session_dir),
             "storage_free_gb": round(
-                get_storage_free_gb(self.session_dir or SD_FALLBACK), 1),
+                get_storage_free_gb(self.session_dir or SSD_MOUNT), 1),
             "cpu_temp": get_cpu_temp(),
             "focus": self.focus_value,
             "exposure_us": self.exposure_us,

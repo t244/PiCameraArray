@@ -19,7 +19,7 @@ while ! mountpoint -q "$SSD_MOUNT" && [ $ELAPSED -lt $TIMEOUT ]; do
     # Mounting it ourselves is a no-op once it is up.
     if [ -e "/dev/disk/by-label/$SSD_LABEL" ]; then
         # Try fstab, then by label, then by device node. Keep the last error:
-        # a silent failure here is what sends a whole session to the SD card.
+        # a silent failure here is what holds a session back unnoticed.
         MOUNT_ERR="$( { mount "$SSD_MOUNT" \
             || mount -L "$SSD_LABEL" "$SSD_MOUNT" \
             || mount "/dev/disk/by-label/$SSD_LABEL" "$SSD_MOUNT"; } 2>&1 )"
@@ -34,11 +34,11 @@ done
 if mountpoint -q "$SSD_MOUNT"; then
     echo "✓ SSD mounted at $SSD_MOUNT ($(df -h --output=avail "$SSD_MOUNT" | tail -1 | tr -d ' ') free)"
 else
-    # The SD card holds roughly 178 MB per burst per camera at the defaults,
-    # so it fills in well under an hour. Make this impossible to miss in the log.
+    # There is no SD-card fallback: camera_agent.py keeps retrying the mount
+    # and holds capture until the SSD is up. Make the wait impossible to miss.
     echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-    echo "!! SSD NOT MOUNTED after ${TIMEOUT}s - falling back to the SD card."
-    echo "!! At default settings the SD card fills in under an hour."
+    echo "!! SSD NOT MOUNTED after ${TIMEOUT}s - capture is HELD until it mounts."
+    echo "!! camera_agent.py keeps retrying; nothing is written to the SD card."
     echo "!! Last mount error: ${MOUNT_ERR:-none}"
     if [ -e "/dev/disk/by-label/$SSD_LABEL" ]; then
         echo "!! The disk IS present but would not mount. Filesystem damaged?"
