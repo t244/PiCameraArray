@@ -34,10 +34,50 @@ on-site focusing and exposure adjustment.
    right (fully manual; the same value is applied to all cameras).
 5. **Arduinoへ書込み** — sends `E<us>` to the Arduino via the master Pi
    (the Pi with the USB serial connection); saved to EEPROM.
-6. **全台 Capture**, then **トリガ開始**.
-7. Remove the router. From now on the system is fully headless: on
-   power-up the Pis boot into capture mode and the Arduino auto-starts
-   after 2 minutes using the EEPROM exposure value.
+6. **全台 Capture**. Check the trigger box lamp turns steady green (all
+   16 Pis ready), then flip the toggle ON: the first burst fires at once.
+   (**トリガ開始/停止** still work as a setup override until the toggle is
+   next moved.)
+7. Remove the router. From now on the system is fully headless and is run
+   with the toggle on the trigger box only (see below).
+
+### Unattended operation (trigger box)
+
+Wiring on the Arduino Uno (details in `capture/exposure_trigger/exposure_trigger.ino`):
+
+| Uno pin | Connection |
+|---|---|
+| D13 | sync output, fanned out to the 16 camera trigger inputs |
+| D2 | capture toggle switch to GND (closed = ON) |
+| D5 / D6 | bicolor LED red / green anode, each via 330 Ω (common cathode to GND) |
+| A0 | shared READY line: 10 kΩ pull-up to the Uno **3.3V** pin, plus one wire to GPIO26 (header pin 37) of every Pi |
+
+Each Pi holds the READY line LOW unless it is recording (booting, waiting
+for the SSD, SSD full, agent stopped); the line is HIGH only when all 16
+have released it. Run `scripts/setup_ready_line.sh` once on every Pi (adds
+`gpio=26=op,dl` to config.txt so the line is LOW from early boot) and
+reinstall `config/picamera-capture.service` (pulls the line LOW when the
+agent stops). Never pull the line up to 5 V: Pi GPIOs are 3.3 V only.
+
+The toggle is level-triggered: capture runs whenever all Pis are ready and
+the toggle is ON. After a power cut, capture therefore resumes by itself.
+Power on with the toggle OFF.
+
+| Lamp | Meaning |
+|---|---|
+| green blinking | waiting for all Pis to become ready |
+| green steady | ready, toggle OFF |
+| red steady | recording, between bursts |
+| red fast blinking | burst in progress |
+| red-red-green flicker every 4 s (over the above) | a Pi dropped out; capture continues; cleared by moving the toggle |
+| red/green alternating | not all Pis ready 5 min after power-on |
+
+The lamp cannot tell which Pi dropped out (TODO: per-Pi lamp).
+
+Each Pi starts a new session directory when no trigger has arrived for
+10 min (`SESSION_GAP_S`), i.e. one directory per drying run between
+toggle ON and OFF. The agent runs `stty -hupcl` on the serial port so an
+agent restart does not reset the Uno; a reset loses only the burst phase.
 
 ### Agent HTTP API (port 8000)
 
@@ -61,7 +101,8 @@ width, so the exposure is a single global value for the whole array.
 ### Burst capture (video analysis)
 
 The Arduino fires a pulse train every period: `fps` (default 30) pulses/s
-for `burst` (default 3 s) → 90 hardware-synchronized frames per burst.
+for `burst` → `fps × burst` hardware-synchronized frames per burst
+(firmware defaults 30 fps × 2 s / 120 s; values in EEPROM take precedence).
 Each Pi buffers the frames in RAM and writes one npz file per burst
 (`<host>_burstNNNN_<timestamp>.npz`) during the idle time between bursts.
 The first tiny burst after trigger start is warm-up (pipeline drop

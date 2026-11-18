@@ -5,39 +5,80 @@
  * whose width equals the sensor exposure time (IMX296 trigger mode).
  *
  * Burst mode: every PERIOD, a train of pulses is generated at FPS rate
- * for BURST milliseconds (e.g. 30 fps x 3000 ms = 90 frames), so all 16
+ * for BURST milliseconds (e.g. 30 fps x 2000 ms = 60 frames), so all 16
  * cameras stay frame-synchronized for video analysis.
+ *
+ * ---------------------------------------------------------------------
+ * Unattended operation (factory runs)
+ * ---------------------------------------------------------------------
+ * Wiring (Arduino Uno):
+ *   D13  sync output, fanned out to the 16 camera trigger inputs
+ *   D2   capture toggle switch to GND        (closed = ON, INPUT_PULLUP)
+ *   D5   bicolor LED, red anode   via 330 ohm (common cathode to GND)
+ *   D6   bicolor LED, green anode via 330 ohm
+ *   A0   shared READY line: 10 k pull-up to the Uno 3.3V pin, and one
+ *        wire to GPIO26 (pin 37) of every Pi. A Pi holds the line LOW
+ *        while it is not ready to record (booting, waiting for the SSD,
+ *        SSD full, agent stopped) and releases it when it is. The line is
+ *        HIGH only when all 16 Pis have released it. Pulled up to 3.3 V,
+ *        never 5 V: Pi GPIOs are not 5 V tolerant. Read as analog because
+ *        3.3 V is at the Uno's digital HIGH threshold.
+ *
+ * The toggle is level-triggered: capture runs whenever the system is
+ * ready AND the toggle is ON. Turning it ON fires the first burst at once
+ * (operator sets the start time); after a power cut capture resumes by
+ * itself once every Pi is ready again. Turning it OFF stops after the
+ * current burst. A reset of this board loses nothing but the burst phase:
+ * every setting is in EEPROM and the state is rebuilt from the inputs.
+ *
+ * Pilot lamp:
+ *   green blinking (1 Hz)      waiting for all Pis to become ready
+ *   green steady               ready, toggle OFF
+ *   red steady                 recording (between bursts)
+ *   red fast blinking          burst in progress
+ *   + red-red-green flicker    every 4 s: a Pi dropped out (latched until
+ *                              the toggle is next moved); capture goes on
+ *   red/green alternating      fatal: not all Pis ready READY_TIMEOUT_MS
+ *                              after power-on (recovers if they come up)
  *
  * Serial protocol (115200 baud, newline-terminated commands):
  *   E<us>   Exposure time / pulse width in microseconds     e.g. "E10000"
- *   T<ms>   Period between burst starts in milliseconds     e.g. "T60000"
+ *   T<ms>   Period between burst starts in milliseconds     e.g. "T120000"
  *   F<fps>  Frame rate within a burst (1..60)               e.g. "F30"
- *   B<ms>   Burst duration in milliseconds                  e.g. "B3000"
- *   S       Start triggering
- *   P       Pause (stop) triggering
- *   R       Report: "EXP <us> PERIOD <ms> FPS <fps> BURST <ms> RUNNING <0|1>"
+ *   B<ms>   Burst duration in milliseconds                  e.g. "B2000"
+ *   S       Start triggering now (setup override, ignores toggle/ready)
+ *   P       Stop triggering now  (setup override)
+ *           An override lasts until the toggle is next moved.
+ *   R       Report: "EXP <us> PERIOD <ms> FPS <fps> BURST <ms> RUNNING <0|1>
+ *            TOGGLE <0|1> LINE <adc> READY <0|1> FAULT <0|1> OVERRIDE <-|S|P>"
  * All setting commands are saved to EEPROM.
  *
  * Note: during a burst (a few seconds) serial commands are not processed.
- *
- * Headless fail-safe: if no serial command is received within
- * AUTO_START_DELAY_MS after power-on, triggering starts automatically
- * using the EEPROM values.
  */
 
 #include <EEPROM.h>
 
-const int SYNC_PIN = 13;  // Output pin (built-in LED for visual feedback)
+const int SYNC_PIN      = 13;  // Output pin (built-in LED for visual feedback)
+const int TOGGLE_PIN    = 2;
+const int LED_RED_PIN   = 5;
+const int LED_GREEN_PIN = 6;
+const int READY_PIN     = A0;
 
-const unsigned long AUTO_START_DELAY_MS = 120000;  // 2 minutes
+const int READY_THRESHOLD = 300;          // ADC counts, ~1.5 V at 5 V ref
+
+const unsigned long READY_GRACE_MS    = 60000;   // ignore the line at boot
+const unsigned long READY_STABLE_MS   = 10000;   // HIGH this long = ready
+const unsigned long READY_TIMEOUT_MS  = 300000;  // not ready by then = fatal
+const unsigned long FAULT_LOW_MS      = 3000;    // LOW this long = Pi fault
+const unsigned long TOGGLE_DEBOUNCE_MS = 50;
 
 // Defaults used when EEPROM is uninitialized
 const unsigned long DEFAULT_EXPOSURE_US = 10000;   // 10 ms
-const unsigned long DEFAULT_PERIOD_MS   = 60000;   // 60 s between bursts
+const unsigned long DEFAULT_PERIOD_MS   = 120000;  // 2 min between bursts
 const unsigned long DEFAULT_FPS         = 30;      // frames/s within burst
-const unsigned long DEFAULT_BURST_MS    = 3000;    // 3 s burst
+const unsigned long DEFAULT_BURST_MS    = 2000;    // 2 s burst
 
-// EEPROM layout (magic bumped: layout changed from single-shot version)
+// EEPROM layout (unchanged from the previous firmware: settings survive)
 const uint32_t EEPROM_MAGIC = 0xC0DE5A02;
 struct Settings {
   uint32_t magic;
@@ -52,9 +93,22 @@ unsigned long period_ms   = DEFAULT_PERIOD_MS;
 unsigned long fps         = DEFAULT_FPS;
 unsigned long burst_ms    = DEFAULT_BURST_MS;
 
-bool running = false;
-bool commandReceived = false;   // any serial command disables auto-start
+// ----- state -----
+bool running = false;            // bursts are being fired
 unsigned long lastBurstTime = 0;
+
+bool toggleOn = false;           // debounced switch position
+int  toggleRaw = HIGH;
+unsigned long toggleChangedAt = 0;
+
+int  lineAdc = 0;
+bool lineHigh = false;
+unsigned long lineHighSince = 0; // 0 = currently LOW
+unsigned long lineLowSince = 0;  // 0 = currently HIGH
+bool systemReady = false;        // latched once all Pis were ready
+bool faultLatched = false;       // a Pi dropped out since the last toggle move
+
+char overrideMode = '-';             // '-' none, 'S' forced run, 'P' forced stop
 
 String rxBuffer = "";
 
@@ -81,6 +135,58 @@ void saveSettings() {
   EEPROM.put(0, s);  // EEPROM.put only writes changed bytes
 }
 
+// ==================== pilot lamp ====================
+
+void setLamp(bool red, bool green) {
+  digitalWrite(LED_RED_PIN, red ? HIGH : LOW);
+  digitalWrite(LED_GREEN_PIN, green ? HIGH : LOW);
+}
+
+bool fatal() {
+  return !systemReady && overrideMode != 'S' && millis() >= READY_TIMEOUT_MS;
+}
+
+// Cheap enough to call inside the burst busy-wait loop.
+void updateLamp(bool inBurst) {
+  unsigned long t = millis();
+
+  if (fatal()) {                                   // red/green alternating
+    bool r = (t / 250) % 2;
+    setLamp(r, !r);
+    return;
+  }
+
+  // Fault flicker overlay: red, red, green within the first 900 ms of
+  // every 4 s, then the base pattern.
+  if (faultLatched) {
+    unsigned long ph = t % 4000;
+    if (ph < 900) {
+      unsigned long slot = ph / 150;               // 0..5
+      bool on = (slot % 2) == 0;
+      if (slot < 4) setLamp(on, false);            // red, red
+      else          setLamp(false, on);            // green
+      return;
+    }
+  }
+
+  if (running) {
+    if (inBurst) setLamp((t / 100) % 2, false);    // red fast blink
+    else         setLamp(true, false);             // red steady
+  } else if (systemReady) {
+    setLamp(false, true);                          // green steady
+  } else {
+    setLamp(false, (t / 500) % 2);                 // green blinking
+  }
+}
+
+// Delay that keeps the lamp alive.
+void lampDelay(unsigned long ms) {
+  unsigned long t0 = millis();
+  while (millis() - t0 < ms) updateLamp(false);
+}
+
+// ==================== trigger output ====================
+
 // One active-LOW pulse of exposure_us microseconds.
 // delayMicroseconds() is only accurate up to ~16383 us.
 void firePulse() {
@@ -95,41 +201,82 @@ void firePulse() {
   digitalWrite(SYNC_PIN, HIGH);
 }
 
-// Warm-up: the camera pipeline discards its first few frames after
-// (re)start, which would otherwise truncate the first real burst.
-// Fire a short pulse train to absorb those dropped frames.
-const unsigned long WARMUP_PULSES = 10;
-void fireWarmup() {
-  unsigned long interval_us = 1000000UL / fps;
-  if (exposure_us + 500 > interval_us) interval_us = exposure_us + 500;
-  for (unsigned long i = 0; i < WARMUP_PULSES; i++) {
-    unsigned long t0 = micros();
-    firePulse();
-    while ((unsigned long)(micros() - t0) < interval_us) { }
-  }
-}
-
-// Pulse train: n frames at fps. Blocking (a few seconds).
-void fireBurst() {
+void firePulseTrain(unsigned long n) {
   unsigned long interval_us = 1000000UL / fps;
   // If exposure doesn't fit in the frame interval, stretch the interval
   if (exposure_us + 500 > interval_us) interval_us = exposure_us + 500;
-
-  unsigned long n = burst_ms * fps / 1000UL;
-  if (n < 1) n = 1;
-
   for (unsigned long i = 0; i < n; i++) {
     unsigned long t0 = micros();
     firePulse();
     // Busy-wait the remainder of the frame interval (handles micros wrap)
-    while ((unsigned long)(micros() - t0) < interval_us) { }
+    while ((unsigned long)(micros() - t0) < interval_us) updateLamp(true);
   }
 }
+
+// Warm-up: the camera pipeline discards its first few frames after
+// (re)start, which would otherwise truncate the first real burst.
+// Fire a short pulse train to absorb those dropped frames.
+const unsigned long WARMUP_PULSES = 10;
+
+// Pulse train: n frames at fps. Blocking (a few seconds).
+void fireBurst() {
+  unsigned long n = burst_ms * fps / 1000UL;
+  if (n < 1) n = 1;
+  firePulseTrain(n);
+  updateLamp(false);
+}
+
+void startRunning() {
+  running = true;
+  firePulseTrain(WARMUP_PULSES);        // absorb pipeline drop-frames
+  lampDelay(2000);
+  lastBurstTime = millis() - period_ms; // first real burst immediately
+}
+
+// ==================== inputs ====================
+
+void readToggle() {
+  int raw = digitalRead(TOGGLE_PIN);
+  unsigned long now = millis();
+  if (raw != toggleRaw) {
+    toggleRaw = raw;
+    toggleChangedAt = now;
+  }
+  bool on = (toggleRaw == LOW);
+  if (on != toggleOn && now - toggleChangedAt >= TOGGLE_DEBOUNCE_MS) {
+    toggleOn = on;
+    overrideMode = '-';          // moving the toggle ends any setup override
+    faultLatched = false;    // and acknowledges a past Pi fault
+  }
+}
+
+void readReadyLine() {
+  unsigned long now = millis();
+  lineAdc = analogRead(READY_PIN);
+  lineHigh = lineAdc > READY_THRESHOLD;
+  if (lineHigh) {
+    if (lineHighSince == 0) lineHighSince = now ? now : 1;
+    lineLowSince = 0;
+  } else {
+    if (lineLowSince == 0) lineLowSince = now ? now : 1;
+    lineHighSince = 0;
+  }
+
+  if (!systemReady) {
+    if (now >= READY_GRACE_MS && lineHigh &&
+        now - lineHighSince >= READY_STABLE_MS) {
+      systemReady = true;
+    }
+  } else if (!lineHigh && now - lineLowSince >= FAULT_LOW_MS) {
+    faultLatched = true;     // a Pi is not (or no longer) recording
+  }
+}
+
+// ==================== serial ====================
 
 void handleCommand(String cmd) {
   cmd.trim();
   if (cmd.length() == 0) return;
-  commandReceived = true;
 
   char c = cmd.charAt(0);
   long v = cmd.substring(1).toInt();
@@ -164,23 +311,24 @@ void handleCommand(String cmd) {
       } else Serial.println(F("ERR B range 100..30000"));
       break;
     case 'S': case 's':
+      overrideMode = 'S';
       Serial.println(F("OK S"));
-      fireWarmup();                             // absorb pipeline drop-frames
-      delay(2000);
-      running = true;
-      lastBurstTime = millis() - period_ms;     // first real burst immediately
       break;
     case 'P': case 'p':
-      running = false;
+      overrideMode = 'P';
       Serial.println(F("OK P"));
       break;
     case 'R': case 'r':
-      Serial.print(F("EXP "));    Serial.print(exposure_us);
-      Serial.print(F(" PERIOD ")); Serial.print(period_ms);
-      Serial.print(F(" FPS "));    Serial.print(fps);
-      Serial.print(F(" BURST "));  Serial.print(burst_ms);
-      Serial.print(F(" RUNNING "));
-      Serial.println(running ? 1 : 0);
+      Serial.print(F("EXP "));       Serial.print(exposure_us);
+      Serial.print(F(" PERIOD "));   Serial.print(period_ms);
+      Serial.print(F(" FPS "));      Serial.print(fps);
+      Serial.print(F(" BURST "));    Serial.print(burst_ms);
+      Serial.print(F(" RUNNING "));  Serial.print(running ? 1 : 0);
+      Serial.print(F(" TOGGLE "));   Serial.print(toggleOn ? 1 : 0);
+      Serial.print(F(" LINE "));     Serial.print(lineAdc);
+      Serial.print(F(" READY "));    Serial.print(systemReady ? 1 : 0);
+      Serial.print(F(" FAULT "));    Serial.print(faultLatched ? 1 : 0);
+      Serial.print(F(" OVERRIDE ")); Serial.println(overrideMode);
       break;
     default:
       Serial.println(F("ERR unknown command"));
@@ -188,11 +336,19 @@ void handleCommand(String cmd) {
   }
 }
 
+// ==================== main ====================
+
 void setup() {
   pinMode(SYNC_PIN, OUTPUT);
   digitalWrite(SYNC_PIN, HIGH);  // Signal normally HIGH (idle)
+  pinMode(TOGGLE_PIN, INPUT_PULLUP);
+  pinMode(LED_RED_PIN, OUTPUT);
+  pinMode(LED_GREEN_PIN, OUTPUT);
+  setLamp(false, false);
   Serial.begin(115200);
   loadSettings();
+  toggleRaw = digitalRead(TOGGLE_PIN);
+  toggleOn = (toggleRaw == LOW);  // position at power-on counts as settled
 }
 
 void loop() {
@@ -209,19 +365,22 @@ void loop() {
     }
   }
 
-  unsigned long now = millis();
+  readToggle();
+  readReadyLine();
 
-  // --- Headless fail-safe auto start ---
-  if (!running && !commandReceived && now >= AUTO_START_DELAY_MS) {
-    fireWarmup();                     // absorb pipeline drop-frames
-    delay(2000);
-    running = true;
-    lastBurstTime = millis() - period_ms;  // first real burst immediately
-  }
+  bool shouldRun;
+  if (overrideMode == 'S')      shouldRun = true;
+  else if (overrideMode == 'P') shouldRun = false;
+  else                      shouldRun = systemReady && toggleOn;
+
+  if (shouldRun && !running) startRunning();
+  else if (!shouldRun && running) running = false;
 
   // --- Periodic burst ---
-  if (running && (now - lastBurstTime >= period_ms)) {
-    lastBurstTime = now;  // period measured start-to-start
+  if (running && (millis() - lastBurstTime >= period_ms)) {
+    lastBurstTime = millis();  // period measured start-to-start
     fireBurst();
   }
+
+  updateLamp(false);
 }

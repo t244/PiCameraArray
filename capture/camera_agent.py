@@ -160,13 +160,55 @@ def get_storage_free_gb(path: str) -> float:
         return 0.0
 
 
-# ==================== PILOT LAMP ====================
+# ==================== PILOT LAMP / READY LINE ====================
+
+# Shared READY line to the trigger Arduino (A0 there, 10 k pull-up to 3.3 V).
+# Every Pi holds it LOW unless it is recording; the Arduino sees it HIGH only
+# when all 16 have released it. config.txt sets "gpio=26=op,dl" so the line
+# is held LOW from early boot, before this agent runs; the systemd unit pulls
+# it LOW again when the agent stops.
+READY_GPIO = 26              # header pin 37
+
+# A trigger gap this long splits the recording into a new session directory:
+# the Arduino stops bursting when its toggle is turned OFF (end of a drying
+# run), and the period is 120 s, so 10 min without a frame means a new run.
+# An Arduino reset or brief power dip does not come close to this.
+SESSION_GAP_S = 600.0
+
+_ready_line_state = None
+_ready_line_warned = False
+
+
+def set_ready_line(ready: bool):
+    """Release (ready) or pull LOW (not ready) the shared READY line."""
+    global _ready_line_state, _ready_line_warned
+    if ready == _ready_line_state:
+        return
+    # Release = input without pull; not ready = output driven low.
+    mode = ["ip", "pn"] if ready else ["op", "dl"]
+    for cmd in (["pinctrl", "set", str(READY_GPIO)] + mode,
+                ["raspi-gpio", "set", str(READY_GPIO)] + mode):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+            if r.returncode == 0:
+                _ready_line_state = ready
+                log.info(f"READY line (GPIO{READY_GPIO}): "
+                         f"{'released' if ready else 'held LOW'}")
+                return
+        except (OSError, subprocess.SubprocessError):
+            continue
+    if not _ready_line_warned:
+        log.error(f"could not drive READY line GPIO{READY_GPIO} "
+                  f"(pinctrl/raspi-gpio unavailable?)")
+        _ready_line_warned = True
 
 # States the operator on site should be able to tell apart at a glance.
 PILOT_WAITING_SSD = "waiting_ssd"    # SSD not mounted yet - capture held
 PILOT_RECORDING = "recording"        # session open on the SSD
 PILOT_STORAGE_FULL = "storage_full"  # stopped: SSD below MIN_FREE_GB
 PILOT_ERROR = "error"                # stopped for another reason
+PILOT_PREVIEW = "preview"            # setup mode, not recording
+PILOT_STARTING = "starting"          # agent up, camera not yet configured
 
 _pilot_state = None
 
@@ -174,13 +216,17 @@ _pilot_state = None
 def indicate(state: str):
     """Show the agent state on a pilot lamp.
 
-    TODO: drive real hardware. Until then this only logs state changes.
+    The array-wide lamp on the trigger Arduino is driven through the shared
+    READY line: it is released only while this Pi is recording.
+
+    TODO: a per-Pi lamp, so the Pi that dropped out can be found on site.
     Options on a Pi 4 without extra parts: the on-board ACT (green) and PWR
     (red) LEDs, via /sys/class/leds/{ACT,PWR}/trigger = "none"/"timer" and
     .../brightness (dtparam=act_led_trigger=none in config.txt keeps the
     kernel from taking ACT back). Otherwise a GPIO LED per Pi.
     """
     global _pilot_state
+    set_ready_line(state == PILOT_RECORDING)
     if state == _pilot_state:
         return
     log.info(f"pilot lamp: {_pilot_state} -> {state}")
@@ -327,8 +373,8 @@ class StreamingOutput(io.BufferedIOBase):
 class ArduinoLink:
     """Persistent serial connection to the trigger Arduino.
 
-    Opened once at startup and kept open: opening the port resets a typical
-    Arduino, so reconnecting on every command would interrupt triggering.
+    Opened once at startup and kept open: opening the port can reset an Uno,
+    so reconnecting on every command would interrupt triggering.
     """
 
     def __init__(self):
@@ -344,9 +390,17 @@ class ArduinoLink:
                 break
         if self.port is None:
             return
+        # Keep DTR asserted when the port is closed, so that reopening it
+        # (agent restart) does not reset the Uno. The first open after boot
+        # still resets it; the firmware rebuilds its state from its inputs.
+        try:
+            subprocess.run(["stty", "-F", self.port, "-hupcl"],
+                           capture_output=True, timeout=5)
+        except (OSError, subprocess.SubprocessError) as e:
+            log.warning(f"stty -hupcl failed on {self.port}: {e}")
         try:
             self.ser = serial.Serial(self.port, SERIAL_BAUD, timeout=2)
-            time.sleep(2.5)  # Arduino resets on open; wait for boot
+            time.sleep(2.5)  # Arduino may reset on open; wait for boot
             self.ser.reset_input_buffer()
             log.info(f"Arduino connected on {self.port}")
         except Exception as e:
@@ -499,6 +553,7 @@ class CameraManager:
         log.info(f"CAPTURE mode - waiting for triggers, saving to {self.session_dir}")
 
     def enter_preview(self):
+        indicate(PILOT_PREVIEW)
         self._close_camera()
         set_trigger_mode(False)
         self.picam2 = Picamera2()
@@ -571,6 +626,9 @@ class CameraManager:
             if self._burst_frames and (
                     time.monotonic() - self._last_frame_mono > BURST_GAP_S):
                 self._flush_burst()
+            if (self.burst_count > 0 and not self._burst_frames and
+                    time.monotonic() - self._last_frame_mono > SESSION_GAP_S):
+                self._start_new_session()
             self.no_trigger_elapsed += CAPTURE_WAIT_CHUNK
             if self.no_trigger_elapsed >= TRIGGER_TIMEOUT:
                 log.warning(f"No trigger received in {TRIGGER_TIMEOUT:.0f}s")
@@ -614,6 +672,23 @@ class CameraManager:
                 self._flush_burst()
         except Exception as e:
             log.error(f"Frame handling failed: {e}")
+
+    def _start_new_session(self):
+        """Open a new session directory without touching the camera.
+
+        Called after SESSION_GAP_S without triggers: the toggle on the
+        trigger box was turned OFF, so the next burst belongs to a new run.
+        Bursts already queued keep the path they were given at flush time.
+        """
+        old = self.session_dir
+        self.session_dir = make_session_dir()
+        self.burst_count = 0
+        self.capture_count = 0
+        log.info(f"no trigger for {SESSION_GAP_S:.0f}s - new session "
+                 f"{self.session_dir} (previous: {old})")
+        free_gb = get_storage_free_gb(self.session_dir)
+        if free_gb < MIN_FREE_GB:
+            self._stop_for_storage(free_gb)
 
     def _flush_burst(self):
         """Move the RAM buffer to the writer queue as one npz file."""
@@ -946,6 +1021,8 @@ def main():
                   "run with: sudo python3 camera_agent.py")
         return 1
 
+    indicate(PILOT_STARTING)  # hold the READY line until recording
+
     global arduino
     arduino = ArduinoLink()
 
@@ -957,6 +1034,7 @@ def main():
 
     def shutdown(signum, frame):
         log.info("Shutdown requested")
+        set_ready_line(False)
         try:
             manager._close_camera()
         finally:

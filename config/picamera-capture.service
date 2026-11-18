@@ -14,6 +14,9 @@ Group=root
 WorkingDirectory=/home/pi/PiCameraArray/capture
 ExecStartPre=/bin/sleep 20
 ExecStart=/home/pi/PiCameraArray/capture/startup.sh
+# Hold the shared READY line LOW whenever the agent is not running, so the
+# trigger box never reads a crashed Pi as ready. '-' ignores a failure.
+ExecStopPost=-/usr/bin/pinctrl set 26 op dl
 Restart=on-failure
 RestartSec=5
 KillMode=mixed
