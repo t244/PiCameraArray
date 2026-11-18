@@ -74,7 +74,22 @@ Power on with the toggle OFF.
 A Pi dropping out during capture is deliberately not shown on the lamp;
 capture continues with the others. The trigger box latches it and reports
 `FAULT 1` in `/trigger/status` until the toggle is next moved, and each
-Pi's log says when and why. (TODO: per-Pi lamp.)
+Pi's log says when and why.
+
+Each Pi also shows its own state on its on-board LEDs (visible through the
+enclosure); find the Pi that dropped out by looking for one without a
+steady green:
+
+| Green (ACT) | Red (PWR) | Meaning |
+|---|---|---|
+| steady | off | recording |
+| blinking | off | agent starting / preview mode |
+| off | blinking | waiting for the SSD |
+| off | steady | stopped: SSD full, error, or agent not running |
+
+During the first seconds of boot the LEDs show the kernel defaults (red
+on, green flickering with SD activity). The red LED no longer flags
+under-voltage; the agent logs `vcgencmd get_throttled` instead.
 
 Each Pi starts a new session directory when no trigger has arrived for
 10 min (`SESSION_GAP_S`), i.e. one directory per drying run between

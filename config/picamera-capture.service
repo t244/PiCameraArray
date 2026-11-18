@@ -17,6 +17,8 @@ ExecStart=/home/pi/PiCameraArray/capture/startup.sh
 # Hold the shared READY line LOW whenever the agent is not running, so the
 # trigger box never reads a crashed Pi as ready. '-' ignores a failure.
 ExecStopPost=-/usr/bin/pinctrl set 26 op dl
+# Per-Pi lamp: agent stopped -> red on, green off (ACT/PWR or led0/led1).
+ExecStopPost=-/bin/sh -c 'for d in /sys/class/leds/PWR /sys/class/leds/led1; do [ -d $$d ] && { echo none > $$d/trigger; echo 1 > $$d/brightness; break; }; done; for d in /sys/class/leds/ACT /sys/class/leds/led0; do [ -d $$d ] && { echo none > $$d/trigger; echo 0 > $$d/brightness; break; }; done'
 Restart=on-failure
 RestartSec=5
 KillMode=mixed

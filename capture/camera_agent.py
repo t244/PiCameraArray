@@ -213,22 +213,63 @@ PILOT_STARTING = "starting"          # agent up, camera not yet configured
 _pilot_state = None
 
 
+# Per-Pi lamp on the Pi 4's own LEDs (visible through the clear enclosure).
+# Kernel names differ by version: ACT/PWR on current kernels, led0/led1 before.
+LED_ROOT = "/sys/class/leds"
+LED_GREEN = ("ACT", "led0")
+LED_RED = ("PWR", "led1")
+
+# state -> (red, green); each "on", "off" or "blink"
+PILOT_LEDS = {
+    PILOT_STARTING:     ("off",   "blink"),   # agent up, not recording yet
+    PILOT_PREVIEW:      ("off",   "blink"),
+    PILOT_RECORDING:    ("off",   "on"),
+    PILOT_WAITING_SSD:  ("blink", "off"),
+    PILOT_STORAGE_FULL: ("on",    "off"),
+    PILOT_ERROR:        ("on",    "off"),
+}
+
+
+def _set_led(names, mode: str):
+    """Drive one on-board LED. Blinking uses the kernel timer trigger, so it
+    keeps going even if this process stalls."""
+    for name in names:
+        d = os.path.join(LED_ROOT, name)
+        if not os.path.isdir(d):
+            continue
+        try:
+            if mode == "blink":
+                with open(os.path.join(d, "trigger"), "w") as f:
+                    f.write("timer")
+                for attr, ms in (("delay_on", 500), ("delay_off", 500)):
+                    with open(os.path.join(d, attr), "w") as f:
+                        f.write(str(ms))
+            else:
+                with open(os.path.join(d, "trigger"), "w") as f:
+                    f.write("none")
+                with open(os.path.join(d, "brightness"), "w") as f:
+                    f.write("1" if mode == "on" else "0")
+        except OSError as e:
+            log.debug(f"LED {name}: {e}")
+        return
+
+
 def indicate(state: str):
     """Show the agent state on a pilot lamp.
 
     The array-wide lamp on the trigger Arduino is driven through the shared
     READY line: it is released only while this Pi is recording.
 
-    TODO: a per-Pi lamp, so the Pi that dropped out can be found on site.
-    Options on a Pi 4 without extra parts: the on-board ACT (green) and PWR
-    (red) LEDs, via /sys/class/leds/{ACT,PWR}/trigger = "none"/"timer" and
-    .../brightness (dtparam=act_led_trigger=none in config.txt keeps the
-    kernel from taking ACT back). Otherwise a GPIO LED per Pi.
+    The per-Pi lamp is the board's own green (ACT) and red (PWR) LEDs, see
+    PILOT_LEDS: green steady = recording, anything red = this Pi is not.
     """
     global _pilot_state
     set_ready_line(state == PILOT_RECORDING)
     if state == _pilot_state:
         return
+    red, green = PILOT_LEDS.get(state, ("on", "off"))
+    _set_led(LED_RED, red)
+    _set_led(LED_GREEN, green)
     log.info(f"pilot lamp: {_pilot_state} -> {state}")
     _pilot_state = state
 
@@ -446,6 +487,7 @@ class CameraManager:
         self.capture_count = 0
         self.no_trigger_elapsed = 0.0
         self.healthy = True
+        self._last_throttled = None
         self._pending_job = None
         self.last_jpeg = None            # thumbnail of last captured frame
         self.last_capture_time = None
@@ -785,7 +827,23 @@ class CameraManager:
         except Exception as e:
             log.debug(f"thumbnail failed: {e}")
 
+    def _check_throttled(self):
+        """Log under-voltage/throttling: the red LED that would normally
+        flag it is used as the pilot lamp."""
+        try:
+            r = subprocess.run(["vcgencmd", "get_throttled"],
+                               capture_output=True, text=True, timeout=5)
+            val = r.stdout.strip().split("=")[-1]
+        except (OSError, subprocess.SubprocessError):
+            return
+        if val and val != self._last_throttled:
+            level = log.info if val == "0x0" else log.warning
+            level(f"get_throttled: {val} (0x50005 = under-voltage now and "
+                  f"since boot, 0x50000 = earlier under-voltage)")
+            self._last_throttled = val
+
     def _health_check(self):
+        self._check_throttled()
         free_gb = get_storage_free_gb(self.session_dir)
         if free_gb < MIN_FREE_GB:
             self._stop_for_storage(free_gb)
