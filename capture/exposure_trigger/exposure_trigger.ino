@@ -36,10 +36,12 @@
  *   green steady               ready, toggle OFF
  *   red steady                 recording (between bursts)
  *   red fast blinking          burst in progress
- *   + red-red-green flicker    every 4 s: a Pi dropped out (latched until
- *                              the toggle is next moved); capture goes on
  *   red/green alternating      fatal: not all Pis ready READY_TIMEOUT_MS
  *                              after power-on (recovers if they come up)
+ *
+ * A Pi dropping out during capture is not shown on the lamp (kept simple
+ * for the operators); it is latched and reported as FAULT 1 by "R" until
+ * the toggle is next moved, and capture goes on with the other Pis.
  *
  * Serial protocol (115200 baud, newline-terminated commands):
  *   E<us>   Exposure time / pulse width in microseconds     e.g. "E10000"
@@ -154,19 +156,6 @@ void updateLamp(bool inBurst) {
     bool r = (t / 250) % 2;
     setLamp(r, !r);
     return;
-  }
-
-  // Fault flicker overlay: red, red, green within the first 900 ms of
-  // every 4 s, then the base pattern.
-  if (faultLatched) {
-    unsigned long ph = t % 4000;
-    if (ph < 900) {
-      unsigned long slot = ph / 150;               // 0..5
-      bool on = (slot % 2) == 0;
-      if (slot < 4) setLamp(on, false);            // red, red
-      else          setLamp(false, on);            // green
-      return;
-    }
   }
 
   if (running) {

@@ -69,10 +69,12 @@ Power on with the toggle OFF.
 | green steady | ready, toggle OFF |
 | red steady | recording, between bursts |
 | red fast blinking | burst in progress |
-| red-red-green flicker every 4 s (over the above) | a Pi dropped out; capture continues; cleared by moving the toggle |
 | red/green alternating | not all Pis ready 5 min after power-on |
 
-The lamp cannot tell which Pi dropped out (TODO: per-Pi lamp).
+A Pi dropping out during capture is deliberately not shown on the lamp;
+capture continues with the others. The trigger box latches it and reports
+`FAULT 1` in `/trigger/status` until the toggle is next moved, and each
+Pi's log says when and why. (TODO: per-Pi lamp.)
 
 Each Pi starts a new session directory when no trigger has arrived for
 10 min (`SESSION_GAP_S`), i.e. one directory per drying run between
