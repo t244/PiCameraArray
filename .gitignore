@@ -140,3 +140,8 @@ output/
 
 # Test-run outputs kept for inspection
 out/
+
+# Slides, paper drafts and the material handed to Claude Design: large binaries, kept out of git
+docs/*.pptx
+docs/*.docx
+docs/design_package/

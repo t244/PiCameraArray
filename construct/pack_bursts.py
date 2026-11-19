@@ -26,6 +26,16 @@ WHAT COUNTS AS ONE BURST
     missed a trigger, so the packer checks every camera for gaps in its burst
     numbering and in its inter-burst interval, and says so before packing.
 
+WHICH DIRECTORY A CAMERA'S FILES COME FROM
+    Each camera directory is named <camera>_<the Pi's start time>, and a
+    session normally holds one per camera. A collection run pointed at the
+    wrong session can leave a second one - 20260728_073439 ended up with
+    e10_20260729_053202, the NEXT day's run - and because the burst index is
+    the key, its burst0001 would silently replace the right one. So per camera
+    only the directory whose start time is closest to the session's own is
+    used, and only if it is within --max-skew of it; every other directory is
+    reported and left out.
+
 CAMERAS THAT HAVE NOT ARRIVED YET
     A camera is included when its file for that burst is fully transferred:
     every complete burst file in a session has exactly the same size, so a
@@ -62,19 +72,68 @@ from datetime import datetime
 from pathlib import Path
 
 BURST_RE = re.compile(r"^(e\d{2})_burst(\d+)_(\d{8}_\d{6})_(\d{3})\.npz$")
+CAM_DIR_RE = re.compile(r"^(e\d{2})_(\d{8}_\d{6})$")
 ALL_CAMS = [f"e{i:02d}" for i in range(16)]
 
 
 # ---------------------------------------------------------------- scanning ---
-def scan_session(session: Path, cameras=None, settle=60.0):
+def _stamp(text: str):
+    try:
+        return datetime.strptime(text, "%Y%m%d_%H%M%S")
+    except ValueError:
+        return None
+
+
+def pick_camera_dirs(session: Path, max_skew: float):
+    """-> (directories to scan, [(directory, reason)] left out).
+
+    One directory per camera: the one whose start time is closest to the
+    session's (the session name, or failing that the median of the cameras'),
+    and within max_skew seconds of it. A directory that does not look like
+    <camera>_<start> is scanned as before, since its time cannot be judged.
+    """
+    dirs = sorted(p for p in session.iterdir() if p.is_dir())
+    named = defaultdict(list)
+    use = []
+    for d in dirs:
+        m = CAM_DIR_RE.match(d.name)
+        t = _stamp(m.group(2)) if m else None
+        if t is None:
+            use.append(d)
+        else:
+            named[m.group(1)].append((t, d))
+    ref = _stamp(session.name)
+    if ref is None:
+        starts = sorted(t for v in named.values() for t, _ in v)
+        ref = starts[len(starts) // 2] if starts else None
+
+    left_out = []
+    for cam in sorted(named):
+        cands = sorted(named[cam], key=lambda td: abs((td[0] - ref).total_seconds()))
+        best_t, best = cands[0]
+        skew = abs((best_t - ref).total_seconds())
+        if skew <= max_skew:
+            use.append(best)
+        else:
+            left_out.append((best, f"starts {skew / 3600:.1f} h from the session"))
+        for _, d in cands[1:]:
+            left_out.append((d, f"second directory for {cam}; using {best.name}"
+                                if skew <= max_skew else
+                                f"starts too far from the session as well"))
+    return sorted(use), left_out
+
+
+def scan_session(session: Path, cameras=None, settle=60.0, max_skew=1800.0):
     """burst index -> {camera: (path, size, mtime_ns, timestamp)} for ready files.
 
     Also returns the files that exist but are not usable yet, so the caller can
-    report them rather than silently pretending they are missing.
+    report them rather than silently pretending they are missing, and the
+    camera directories that were left out (see pick_camera_dirs).
     """
     by_size = defaultdict(int)
     found = defaultdict(dict)
-    for cam_dir in sorted(p for p in session.iterdir() if p.is_dir()):
+    cam_dirs, left_out = pick_camera_dirs(session, max_skew)
+    for cam_dir in cam_dirs:
         for f in cam_dir.iterdir():
             m = BURST_RE.match(f.name)
             if not m:
@@ -87,7 +146,7 @@ def scan_session(session: Path, cameras=None, settle=60.0):
             found[idx][cam] = (f, st.st_size, st.st_mtime_ns, f"{ts}.{ms}")
 
     if not by_size:
-        return {}, [], 0
+        return {}, [], 0, left_out
     # A complete burst file is always the same size; anything else is in flight.
     canonical = max(by_size.items(), key=lambda kv: (kv[1], kv[0]))[0]
 
@@ -102,7 +161,7 @@ def scan_session(session: Path, cameras=None, settle=60.0):
                 pending.append((cam, idx, path, size, "just written"))
             else:
                 ready[idx][cam] = rec
-    return dict(ready), pending, canonical
+    return dict(ready), pending, canonical, left_out
 
 
 def check_indexing(ready, pending=()):
@@ -317,6 +376,9 @@ def main():
                     help="skip bursts with fewer cameras than this (default 1)")
     ap.add_argument("--settle", type=float, default=60.0,
                     help="ignore files written within the last N seconds (default 60)")
+    ap.add_argument("--max-skew", type=float, default=1800.0,
+                    help="seconds a camera directory's start may differ from the "
+                         "session's before it is left out (default 1800)")
     ap.add_argument("--check", action="store_true", help="report only, write nothing")
     ap.add_argument("--force", action="store_true", help="re-pack even when unchanged")
     ap.add_argument("--dry-run", action="store_true")
@@ -335,7 +397,10 @@ def main():
     print(f"output  : {out_dir}   format={args.format}"
           + (f" link={args.link}" if args.format == "dir" else ""))
 
-    ready, pending, canonical = scan_session(session, cameras, args.settle)
+    ready, pending, canonical, left_out = scan_session(session, cameras, args.settle,
+                                                       args.max_skew)
+    for d, why in left_out:
+        print(f"LEFT OUT: {d.name}  ({why})")
     if not ready:
         sys.exit("no complete burst files found")
     print(f"burst files: {sum(len(c) for c in ready.values())} usable, "
