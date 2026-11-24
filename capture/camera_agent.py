@@ -277,6 +277,46 @@ def indicate(state: str):
 
 SSD_DEVICE_LINK = f"/dev/disk/by-label/{SSD_LABEL}"
 
+# A Pi may instead carry several smaller SSDs (HIKSEMI1, HIKSEMI2, ...) pooled
+# by mergerfs at SSD_MOUNT; see scripts/setup_ssd_pool.sh. Each disk holds a
+# "pool" directory and the pool is the union of those, so the data directory
+# exists only once at least one member disk is really mounted.
+SSD_POOL_LINKS = f"/dev/disk/by-label/{SSD_LABEL}[0-9]*"
+
+
+def _ssd_is_pool() -> bool:
+    """True when /etc/fstab mounts SSD_MOUNT as a mergerfs pool."""
+    try:
+        with open("/etc/fstab") as f:
+            for line in f:
+                fields = line.split()
+                if (len(fields) >= 3 and not fields[0].startswith("#")
+                        and fields[1] == SSD_MOUNT and "mergerfs" in fields[2]):
+                    return True
+    except OSError:
+        pass
+    return False
+
+
+def _ssd_ready() -> bool:
+    """Mounted, and for a pool, backed by at least one member disk.
+
+    An empty mergerfs pool (no member disk mounted) is still a mount point,
+    but has nowhere to write: insist on its data directory.
+    """
+    if not os.path.ismount(SSD_MOUNT):
+        return False
+    if _ssd_is_pool():
+        return os.path.isdir(os.path.join(SSD_MOUNT, "data"))
+    return True
+
+
+def _ssd_present() -> bool:
+    """Has the SSD (or at least one pool member) enumerated?"""
+    if _ssd_is_pool():
+        return bool(glob.glob(SSD_POOL_LINKS))
+    return os.path.exists(SSD_DEVICE_LINK)
+
 
 def _try_mount() -> str:
     """Try every reasonable way to mount the SSD.
@@ -284,16 +324,23 @@ def _try_mount() -> str:
     Returns "" on success, otherwise the collected error text. Never hide the
     error: a silent failure here is what holds a session back unnoticed.
     """
-    attempts = [
-        ["mount", SSD_MOUNT],                       # via /etc/fstab
-        ["mount", "-L", SSD_LABEL, SSD_MOUNT],      # by label, no fstab needed
-        ["mount", SSD_DEVICE_LINK, SSD_MOUNT],      # by device node
-    ]
+    if _ssd_is_pool():
+        attempts = []
+        if os.path.ismount(SSD_MOUNT):
+            # Pool mounted before its disks: remount once they are there.
+            attempts.append(["umount", "-l", SSD_MOUNT])
+        attempts.append(["mount", "-a"])            # member disks, then pool
+    else:
+        attempts = [
+            ["mount", SSD_MOUNT],                   # via /etc/fstab
+            ["mount", "-L", SSD_LABEL, SSD_MOUNT],  # by label, no fstab needed
+            ["mount", SSD_DEVICE_LINK, SSD_MOUNT],  # by device node
+        ]
     errors = []
     for cmd in attempts:
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-            if os.path.ismount(SSD_MOUNT):
+            if cmd[0] == "mount" and _ssd_ready():
                 return ""
             msg = (r.stderr or r.stdout or f"exit {r.returncode}").strip()
             errors.append(f"`{' '.join(cmd)}` -> {msg}")
@@ -315,7 +362,7 @@ def wait_for_ssd(timeout=SSD_WAIT_S) -> bool:
     case the fstab entry is never retried and the disk sits there, healthy and
     unmounted, forever.
     """
-    if os.path.ismount(SSD_MOUNT):
+    if _ssd_ready():
         return True
 
     indicate(PILOT_WAITING_SSD)
@@ -326,18 +373,19 @@ def wait_for_ssd(timeout=SSD_WAIT_S) -> bool:
     reason = "not started"
 
     while timeout is None or time.monotonic() - t0 < timeout:
-        if os.path.ismount(SSD_MOUNT):
+        if _ssd_ready():
             log.info(f"{SSD_MOUNT} mounted after {time.monotonic() - t0:.0f}s")
             return True
 
-        if os.path.exists(SSD_DEVICE_LINK):
+        if _ssd_present():
             reason = _try_mount() or "mounted"
-            if os.path.ismount(SSD_MOUNT):
+            if _ssd_ready():
                 log.info(f"{SSD_MOUNT} mounted after "
                          f"{time.monotonic() - t0:.0f}s")
                 return True
         else:
-            reason = (f"{SSD_DEVICE_LINK} does not exist - the SSD has not "
+            want = SSD_POOL_LINKS if _ssd_is_pool() else SSD_DEVICE_LINK
+            reason = (f"{want} does not exist - the SSD has not "
                       f"enumerated (check the USB port/cable: lsusb, dmesg)")
 
         waited = time.monotonic() - t0

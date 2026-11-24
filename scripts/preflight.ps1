@@ -6,6 +6,9 @@
     Queries every Pi and prints one table row each, flagging anything that
     would ruin a field session:
 
+      N        how many USB disks the Pi sees (and how many run at USB2)
+      POOL     ext4 = one SSD; mergerfs = several SSDs pooled as HIKSEMI
+      THR      vcgencmd get_throttled; anything but 0x0 is under-voltage
       SSD      the capture SSD is really mounted (not just the directory)
       FSTAB    the LABEL=HIKSEMI entry exists, so the mount survives reboot
       SVC      picamera-capture is running
@@ -106,7 +109,8 @@ else {
 $rows = foreach ($r in $raw) {
     if (-not $r.Line) {
         [pscustomobject]@{
-            Host = $r.Hostname; DISK = '?'; FS = '?'; SSD = '?'; FSTAB = '?'
+            Host = $r.Hostname; DISK = '?'; N = '?'; POOL = '?'; THR = '?'
+            FS = '?'; SSD = '?'; FSTAB = '?'
             SVC = '?'; TRIG = '?'; SESS = '?'; WIFI = '?'; ARDUINO = '?'
             Free = '-'; Temp = '-'
             Problems = @("UNREACHABLE: $($r.Error)")
@@ -130,6 +134,23 @@ $rows = foreach ($r in $raw) {
     }
     elseif (-not $labelOk) {
         $problems += "disk $($kv['usbdisk']) present but has no HIKSEMI filesystem - run deploy_prepare_ssd.ps1 -Format"
+    }
+
+    # Every USB disk, so a second (or fourth) SSD on one Pi is visible.
+    $diskList = @()
+    if ($kv['disks']) { $diskList = @($kv['disks'] -split ',' | Where-Object { $_ }) }
+    $nUsb2 = @($diskList | Where-Object { $_ -match '/480M/' }).Count
+    $hik = [int]($kv['hiksemi'] -as [int])
+    $pooled = $kv['fstype'] -eq 'fuse.mergerfs'
+    if ($hik -gt 1 -and -not $pooled) {
+        $problems += "$hik partitions labelled HIKSEMI but no pool - which one mounts is arbitrary"
+    }
+    foreach ($d in $diskList) {
+        if ($d -notmatch '/HIKSEMI') { $problems += "USB disk without a HIKSEMI filesystem: $d" }
+        elseif ($d -notmatch '/mnt$') { $problems += "HIKSEMI disk not mounted: $d" }
+    }
+    if ($kv['thr'] -and $kv['thr'] -ne '0x0') {
+        $problems += "throttled=$($kv['thr']) - under-voltage since boot (too many bus-powered disks?)"
     }
 
     $ssdOk = $kv['ssd'] -eq 'yes'
@@ -156,6 +177,9 @@ $rows = foreach ($r in $raw) {
     [pscustomobject]@{
         Host    = $kv['host']
         DISK    = if ($diskOk)  { $kv['usbdisk'] } else { 'NONE' }
+        N       = if ($nUsb2) { "$($diskList.Count)($nUsb2 USB2)" } else { "$($diskList.Count)" }
+        POOL    = if ($pooled) { 'mergerfs' } elseif ($kv['fstype']) { $kv['fstype'] } else { '?' }
+        THR     = $kv['thr']
         FS      = if ($labelOk) { 'ok' } else { 'FAIL' }
         SSD     = if ($ssdOk)   { 'ok' } else { 'FAIL' }
         FSTAB   = if ($fstabOk) { 'ok' } else { 'FAIL' }
@@ -174,7 +198,7 @@ $rows = foreach ($r in $raw) {
 
 Write-Host ""
 $rows | Sort-Object Host |
-    Format-Table Host, DISK, FS, SSD, FSTAB, SVC, TRIG, SESS, WIFI, ARDUINO, Free, Temp -AutoSize |
+    Format-Table Host, DISK, N, POOL, FS, SSD, FSTAB, SVC, TRIG, SESS, WIFI, ARDUINO, THR, Free, Temp -AutoSize |
     Out-String -Width 220 | Write-Host
 
 if ($Detail) {

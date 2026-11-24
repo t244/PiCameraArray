@@ -9,6 +9,12 @@
 #   ssd      yes | NO   - is the SSD actually mounted (not just the directory)
 #   free     free space on the SSD
 #   fstab    number of LABEL=HIKSEMI entries in /etc/fstab (expect 1)
+#   usbdisk  USB disks enumerated (comma-separated), - if none
+#   label    yes | NO   - does /dev/disk/by-label/HIKSEMI exist
+#   disks    every USB disk: name/size/speed/labels/mnt|-, comma-separated
+#   hiksemi  number of partitions labelled HIKSEMI (1, or one per pooled disk)
+#   fstype   filesystem at the capture path: ext4, fuse.mergerfs, or -
+#   thr      vcgencmd get_throttled (0x0 = no under-voltage since boot)
 #   wifi     comma-separated "profile/priority" for every wifi profile
 #   mode     capture | preview
 #   count    frames captured this session (0 = no trigger arriving)
@@ -39,7 +45,9 @@ else
     out+=";ssd=NO;free=-"
 fi
 
-fstab="$(grep -c '^LABEL=HIKSEMI[[:space:]]' /etc/fstab 2>/dev/null | first)"
+# The entry that mounts the capture path: LABEL=HIKSEMI (one SSD) or the
+# mergerfs pool line (several SSDs, see setup_ssd_pool.sh).
+fstab="$(grep -cE "^[^#[:space:]]+[[:space:]]+${MOUNT}[[:space:]]" /etc/fstab 2>/dev/null | first)"
 out+=";fstab=${fstab:-0}"
 
 # Is a USB disk even enumerated? Distinguishes "the SSD is unplugged or the
@@ -49,8 +57,39 @@ usbdisk="$(lsblk -dn -o NAME,TRAN 2>/dev/null \
 out+=";usbdisk=${usbdisk:--}"
 
 lbl=NO
-[ -e "/dev/disk/by-label/${LABEL_NAME:-HIKSEMI}" ] && lbl=yes
+compgen -G "/dev/disk/by-label/${LABEL_NAME:-HIKSEMI}*" >/dev/null && lbl=yes
 out+=";label=$lbl"
+
+# Every USB disk, not just the one that got mounted: a Pi may carry several
+# (e13 pools four 250 GB SSDs). Per disk "name/size/link speed/labels/mounted":
+#   sda/1000G/5000M/HIKSEMI/mnt     speed 5000M = USB3, 480M = USB2
+disks=""
+hik=0
+while read -r name tran size; do
+    [[ "$tran" == usb ]] || continue
+    dev="$(readlink -f "/sys/block/$name/device" 2>/dev/null)"
+    spd="$(cat "$dev/../../../../speed" 2>/dev/null | tr -d '\r\n')"
+    labels=""; mnt="-"
+    while IFS= read -r line; do
+        NAME="" LABEL="" MOUNTPOINT=""
+        eval "$line"
+        [[ -n "$LABEL" ]] && labels+="${LABEL}+"
+        [[ "$LABEL" =~ ^${LABEL_NAME:-HIKSEMI}[0-9]*$ ]] && hik=$((hik + 1))
+        [[ -n "$MOUNTPOINT" ]] && mnt="mnt"
+    done < <(lsblk -nP -o NAME,LABEL,MOUNTPOINT "/dev/$name" 2>/dev/null | tail -n +2)
+    labels="${labels%+}"
+    disks+="${name}/$((size / 1000000000))G/${spd:-?}M/${labels:--}/${mnt},"
+done < <(lsblk -dnb -o NAME,TRAN,SIZE 2>/dev/null)
+out+=";disks=${disks%,};hiksemi=$hik"
+
+# What is mounted at the capture path: ext4 (one SSD) or fuse.mergerfs (pool).
+fstype="$(findmnt -no FSTYPE "$MOUNT" 2>/dev/null | first)"
+out+=";fstype=${fstype:--}"
+
+# Several bus-powered SSDs can overdraw the Pi's USB supply. 0x0 = never
+# throttled or under-voltage since boot.
+thr="$(vcgencmd get_throttled 2>/dev/null | cut -d= -f2 | first)"
+out+=";thr=${thr:-?}"
 
 wifi="$(nmcli -t -f NAME,TYPE connection show 2>/dev/null \
         | awk -F: '$NF=="802-11-wireless"{NF--; print}' OFS=: \
