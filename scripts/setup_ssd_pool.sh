@@ -113,8 +113,12 @@ fi
 # --- 2. mergerfs ---------------------------------------------------------------
 if ! command -v mergerfs >/dev/null 2>&1; then
     log "installing mergerfs"
-    apt-get install -y mergerfs >/dev/null || die "apt-get install mergerfs failed (network?)"
+    # apt also exits non-zero over unrelated half-configured packages (seen:
+    # rpi-chromium-mods waiting at a conffile prompt); judge by the result.
+    DEBIAN_FRONTEND=noninteractive apt-get install -y mergerfs >/dev/null 2>&1 \
+        || warn "apt-get reported an error; checking whether mergerfs got installed"
 fi
+command -v mergerfs >/dev/null 2>&1 || die "mergerfs is not installed (network?)"
 log "mergerfs: $(mergerfs --version 2>&1 | head -1)"
 
 # --- 3. release everything ------------------------------------------------------

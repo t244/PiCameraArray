@@ -91,6 +91,16 @@ During the first seconds of boot the LEDs show the kernel defaults (red
 on, green flickering with SD activity). The red LED no longer flags
 under-voltage; the agent logs `vcgencmd get_throttled` instead.
 
+Each Pi records to one SSD mounted at `/media/pi/HIKSEMI`
+(`scripts/deploy_prepare_ssd.ps1`). A Pi without a large enough disk can
+pool several instead (e13: four 250 GB SSDs) with
+`scripts/setup_ssd_pool.sh`: each disk is ext4 `HIKSEMI1..N` at
+`/mnt/hiksemiN`, pooled by mergerfs, so a failed disk loses only its own
+bursts. On a PC, ingest each disk's `pool` directory
+(`construct/ingest_ssd.sh ... <disk>/pool`) into the same collection.
+Bus-powered disks share the Pi's USB supply: `scripts/preflight.ps1` lists
+every disk and flags under-voltage (THR column).
+
 Each Pi starts a new session directory when no trigger has arrived for
 5 min (`SESSION_GAP_S`), i.e. one directory per drying run between
 toggle ON and OFF. The agent runs `stty -hupcl` on the serial port so an
