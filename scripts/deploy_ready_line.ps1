@@ -65,7 +65,9 @@ function Join-Remote([string]$text) {
 $cmd = if ($Verify) { Join-Remote $check } else { Join-Remote ($apply + "`n" + $check) }
 if ($Reboot -and -not $Verify) { $cmd += "; echo 'rebooting'; sudo systemctl reboot" }
 
-$indices = if ($Only) { $Only } else { $First..$Last }
+# Not "if ($Only)": an array holding the single value 0 counts as false, and
+# "-Only 0" would then mean all hosts.
+$indices = if ($PSBoundParameters.ContainsKey('Only')) { $Only } else { $First..$Last }
 $mode = if ($Verify) { 'VERIFY' } elseif ($Reboot) { 'APPLY + REBOOT' } else { 'APPLY' }
 Write-Host "=== $mode : $($indices.Count) hosts ===" -ForegroundColor Cyan
 

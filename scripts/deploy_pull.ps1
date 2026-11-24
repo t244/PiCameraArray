@@ -30,7 +30,9 @@ if (-not (Get-Command plink -ErrorAction SilentlyContinue)) {
     throw "plink not found on PATH. Install the PuTTY tools first."
 }
 
-$indices = if ($Only) { $Only } else { $First..$Last }
+# Not "if ($Only)": an array holding the single value 0 counts as false, and
+# "-Only 0" would then mean all hosts.
+$indices = if ($PSBoundParameters.ContainsKey('Only')) { $Only } else { $First..$Last }
 # Remote shell command. Single-quoted here-string: PowerShell expands nothing
 # inside it; __REPO__ and __CHECKOUT__ are substituted below.
 $remote = @'
