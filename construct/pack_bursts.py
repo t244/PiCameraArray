@@ -72,7 +72,9 @@ from datetime import datetime
 from pathlib import Path
 
 BURST_RE = re.compile(r"^(e\d{2})_burst(\d+)_(\d{8}_\d{6})_(\d{3})\.npz$")
-CAM_DIR_RE = re.compile(r"^(e\d{2})_(\d{8}_\d{6})$")
+# A session directory may carry a _N suffix when its name already existed
+# (camera_agent.make_session_dir: the clock ran back after a power cut).
+CAM_DIR_RE = re.compile(r"^(e\d{2})_(\d{8}_\d{6})(?:_\d+)?$")
 ALL_CAMS = [f"e{i:02d}" for i in range(16)]
 
 

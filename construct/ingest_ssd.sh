@@ -323,7 +323,7 @@ if [[ -n "$SINGLE_SESSION" ]]; then
     SESSIONS=("$SINGLE_SESSION")
 else
     while IFS= read -r d; do SESSIONS+=("$d"); done \
-        < <(cd "$SRC_DATA" 2>/dev/null && ls -1 2>/dev/null | grep -E '^[0-9]{8}_[0-9]{6}$' | sort -r)
+        < <(cd "$SRC_DATA" 2>/dev/null && ls -1 2>/dev/null | grep -E '^[0-9]{8}_[0-9]{6}(_[0-9]+)?$' | sort -r)
 fi
 (( ${#SESSIONS[@]} > 0 )) || die "no session directories (YYYYmmdd_HHMMSS) under $SRC_DATA"
 

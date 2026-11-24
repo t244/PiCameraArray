@@ -242,7 +242,7 @@ for dev in "${PARTS[@]}"; do
                "$dev" "$cam" "$sess" "$n" "$have" "$adds" "$flag"
         DISK_INFO[$dev]="${DISK_INFO[$dev]:-}$sess:$n:$adds "
     done < <(find "$src" -maxdepth 2 -type d -regextype posix-extended \
-                  -regex '.*/[0-9]{8}_[0-9]{6}$' 2>/dev/null | sort)
+                  -regex '.*/[0-9]{8}_[0-9]{6}(_[0-9]+)?$' 2>/dev/null | sort)
     if (( found == 0 )); then
         printf '%-12s %-8s %-22s %8s %10s   %s\n' \
                "$dev" "?" "-" "-" "-" "no capture session found"

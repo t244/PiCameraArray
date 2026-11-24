@@ -78,6 +78,17 @@ PREVIEW_FPS = 10
 PREVIEW_JPEG_Q = 70
 
 
+def _read_boot_id() -> str:
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+BOOT_ID = _read_boot_id()       # changes on every boot; saved in each npz
+
+
 def preview_frame_us(exposure_us) -> int:
     """Preview frame time: PREVIEW_FPS, longer only for long exposures."""
     return max(int(exposure_us) + 1000, int(1e6 / PREVIEW_FPS))
@@ -420,8 +431,20 @@ def make_session_dir() -> str:
     """
     wait_for_ssd()
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = f"{SSD_MOUNT}/data/{ts}"
-    os.makedirs(path, exist_ok=True)
+    # Never merge into an existing session: without an RTC the clock can
+    # run back after a power cut and repeat an earlier directory name.
+    base = f"{SSD_MOUNT}/data/{ts}"
+    path = base
+    n = 1
+    while True:
+        try:
+            os.makedirs(path)
+            break
+        except FileExistsError:
+            n += 1
+            path = f"{base}_{n}"
+    if n > 1:
+        log.warning(f"{base} already exists (clock ran back?) - using {path}")
     log.info(f"recording to SSD: {path} "
              f"({get_storage_free_gb(SSD_MOUNT):.0f} GB free)")
     return path
@@ -556,6 +579,7 @@ class CameraManager:
         self.burst_count = 0
         self._burst_frames = []
         self._burst_times = []
+        self._burst_mono = []            # time.monotonic() per frame
         self._burst_meta = None          # per-burst sensor metadata
         self._last_y_small = None        # half-res Y for thumbnails
         self._last_frame_mono = 0.0
@@ -622,6 +646,7 @@ class CameraManager:
         self.burst_count = 0
         self._burst_frames = []
         self._burst_times = []
+        self._burst_mono = []
         self.no_trigger_elapsed = 0.0
         self.picam2 = Picamera2()
         # Video configuration: main YUV420 for thumbnails; raw stream
@@ -762,10 +787,12 @@ class CameraManager:
             if not CAPTURE_RAW:
                 frame = np.ascontiguousarray(
                     arr[:IMAGE_HEIGHT, :IMAGE_WIDTH])
+            now_mono = time.monotonic()
             self._burst_frames.append(frame)
             self._burst_times.append(
                 datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3])
-            self._last_frame_mono = time.monotonic()
+            self._burst_mono.append(now_mono)
+            self._last_frame_mono = now_mono
             self.capture_count += 1
             self.last_capture_time = datetime.now().isoformat(
                 timespec="seconds")
@@ -799,9 +826,11 @@ class CameraManager:
             return
         frames = np.stack(self._burst_frames)
         times = np.array(self._burst_times)
+        mono = np.array(self._burst_mono, dtype=np.float64)
         meta = self._burst_meta or {}
         self._burst_frames = []
         self._burst_times = []
+        self._burst_mono = []
         self._burst_meta = None
         self.burst_count += 1
 
@@ -821,6 +850,13 @@ class CameraManager:
             }
         else:
             arrays = {"frames": frames, "timestamps": times}
+        # Clock-independent timing. There is no RTC: after a power cut the
+        # wall clock restarts from fake-hwclock (up to ~1 h back), so
+        # "timestamps" can jump. mono_s (seconds since boot, never steps)
+        # plus boot_id orders the bursts of one boot exactly; a new boot_id
+        # marks a power cycle.
+        arrays["mono_s"] = mono
+        arrays["boot_id"] = np.array(BOOT_ID)
 
         self._writer_queue.put((path, arrays))
         log.info(f"Burst {self.burst_count}: {len(times)} frames "

@@ -10,6 +10,10 @@ Burst npz layout (CAPTURE_RAW=True in camera_agent.py):
     raw_shape     : (2,) [H, W]
     black_levels  : (4,) sensor black levels on a 16-bit scale (>>6 = 10bit)
     analogue_gain : float
+    mono_s        : (N,) float64, time.monotonic() per frame (since 2026-11-25)
+    boot_id       : str, /proc/sys/kernel/random/boot_id of the Pi's boot
+    The wall-clock "timestamps" can step back after a power cut (no RTC);
+    within one boot_id, mono_s orders frames and bursts exactly.
 
 Typical use in analysis:
     from raw10 import load_burst
@@ -74,6 +78,9 @@ def load_burst(path, subtract_black: bool = True):
             "black_subtracted": bool(subtract_black and black10 > 0),
             "analogue_gain": gain,
             "raw_format": str(d["raw_format"]) if "raw_format" in d.files else "",
+            # absent in files written before 2026-11-25
+            "mono_s": d["mono_s"] if "mono_s" in d.files else None,
+            "boot_id": str(d["boot_id"]) if "boot_id" in d.files else "",
         }
         return frames, ts, meta
 
