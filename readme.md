@@ -92,7 +92,7 @@ on, green flickering with SD activity). The red LED no longer flags
 under-voltage; the agent logs `vcgencmd get_throttled` instead.
 
 Each Pi starts a new session directory when no trigger has arrived for
-10 min (`SESSION_GAP_S`), i.e. one directory per drying run between
+5 min (`SESSION_GAP_S`), i.e. one directory per drying run between
 toggle ON and OFF. The agent runs `stty -hupcl` on the serial port so an
 agent restart does not reset the Uno; a reset loses only the burst phase.
 

@@ -76,7 +76,7 @@ SSD_MOUNT = "/media/pi/HIKSEMI"
 SSD_LABEL = "HIKSEMI"
 
 CAPTURE_WAIT_CHUNK = 1.0     # polling slice; mode-switch latency upper bound
-TRIGGER_TIMEOUT = 600.0      # warn if no trigger for this long
+TRIGGER_TIMEOUT = 300.0      # warn if no trigger for this long (= SESSION_GAP_S)
 
 # Capture never falls back to the SD card: a session without the SSD is a
 # setup error, and the SD card would fill (and take the OS down) within the
@@ -171,9 +171,10 @@ READY_GPIO = 21              # header pin 40 (GND: pin 34)
 
 # A trigger gap this long splits the recording into a new session directory:
 # the Arduino stops bursting when its toggle is turned OFF (end of a drying
-# run), and the period is 120 s, so 10 min without a frame means a new run.
-# An Arduino reset or brief power dip does not come close to this.
-SESSION_GAP_S = 600.0
+# run), and the period is 120 s, so 5 min without a frame (two or more
+# missed bursts in a row) means a new run. An Arduino reset or brief power
+# dip does not come close to this.
+SESSION_GAP_S = 300.0
 
 _ready_line_state = None
 _ready_line_warned = False
