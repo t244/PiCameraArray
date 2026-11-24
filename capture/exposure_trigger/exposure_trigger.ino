@@ -17,7 +17,7 @@
  *   D5   bicolor LED, red anode   via 330 ohm (common cathode to GND)
  *   D6   bicolor LED, green anode via 330 ohm
  *   A0   shared READY line: 10 k pull-up to the Uno 3.3V pin, and one
- *        wire to GPIO26 (pin 37) of every Pi. A Pi holds the line LOW
+ *        wire to GPIO21 (pin 40) of every Pi. A Pi holds the line LOW
  *        while it is not ready to record (booting, waiting for the SSD,
  *        SSD full, agent stopped) and releases it when it is. The line is
  *        HIGH only when all 16 Pis have released it. Pulled up to 3.3 V,

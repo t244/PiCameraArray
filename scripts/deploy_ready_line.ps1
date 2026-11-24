@@ -5,7 +5,7 @@
 .DESCRIPTION
     On each Pi (repo already pulled, e.g. with deploy_pull.ps1):
       1. sudo bash scripts/setup_ready_line.sh
-         -> adds "gpio=26=op,dl" to config.txt so GPIO26 (READY) is LOW from
+         -> adds "gpio=21=op,dl" to config.txt so GPIO21 (READY, pin 40) is LOW from
             early boot. Takes effect after a reboot.
       2. copies config/picamera-capture.service to /etc/systemd/system and
          reloads systemd (the unit pulls READY LOW when the agent stops).
@@ -53,7 +53,7 @@ sudo systemctl daemon-reload
 $check = @'
 cd '__REPO__' 2>/dev/null
 CFG=/boot/firmware/config.txt; [ -f "$CFG" ] || CFG=/boot/config.txt
-if grep -qxF 'gpio=26=op,dl' "$CFG"; then echo 'config=ok'; else echo 'config=MISSING'; fi
+if grep -qxF 'gpio=21=op,dl' "$CFG"; then echo 'config=ok'; else echo 'config=MISSING'; fi
 if cmp -s config/picamera-capture.service /etc/systemd/system/picamera-capture.service; then echo 'unit=ok'; else echo 'unit=DIFFERS'; fi
 echo "head=$(git log -1 --format=%h 2>/dev/null) svc=$(systemctl is-active picamera-capture 2>/dev/null)"
 '@
@@ -90,7 +90,7 @@ Write-Host ""
 if ($bad.Count -eq 0) {
     Write-Host "All $($results.Count) Pis OK." -ForegroundColor Green
     if (-not $Reboot -and -not $Verify) {
-        Write-Host "Reboot the Pis for gpio=26=op,dl to take effect (or rerun with -Reboot)." -ForegroundColor Yellow
+        Write-Host "Reboot the Pis for gpio=21=op,dl to take effect (or rerun with -Reboot)." -ForegroundColor Yellow
     }
 } else {
     Write-Host ("Check: {0}" -f (($bad | ForEach-Object Host) -join ', ')) -ForegroundColor Red

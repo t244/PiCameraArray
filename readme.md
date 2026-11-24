@@ -50,12 +50,12 @@ Wiring on the Arduino Uno (details in `capture/exposure_trigger/exposure_trigger
 | D13 | sync output, fanned out to the 16 camera trigger inputs |
 | D2 | capture toggle switch to GND (closed = ON) |
 | D5 / D6 | bicolor LED red / green anode, each via 330 Ω (common cathode to GND) |
-| A0 | shared READY line: 10 kΩ pull-up to the Uno **3.3V** pin, plus one wire to GPIO26 (header pin 37) of every Pi |
+| A0 | shared READY line: 10 kΩ pull-up to the Uno **3.3V** pin, plus one wire to GPIO21 (header pin 40) of every Pi, with ground from pin 34 |
 
 Each Pi holds the READY line LOW unless it is recording (booting, waiting
 for the SSD, SSD full, agent stopped); the line is HIGH only when all 16
 have released it. Run `scripts/setup_ready_line.sh` once on every Pi (adds
-`gpio=26=op,dl` to config.txt so the line is LOW from early boot) and
+`gpio=21=op,dl` to config.txt so the line is LOW from early boot) and
 reinstall `config/picamera-capture.service` (pulls the line LOW when the
 agent stops). Never pull the line up to 5 V: Pi GPIOs are 3.3 V only.
 

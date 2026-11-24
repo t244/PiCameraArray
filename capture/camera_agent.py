@@ -164,10 +164,10 @@ def get_storage_free_gb(path: str) -> float:
 
 # Shared READY line to the trigger Arduino (A0 there, 10 k pull-up to 3.3 V).
 # Every Pi holds it LOW unless it is recording; the Arduino sees it HIGH only
-# when all 16 have released it. config.txt sets "gpio=26=op,dl" so the line
+# when all 16 have released it. config.txt sets "gpio=21=op,dl" so the line
 # is held LOW from early boot, before this agent runs; the systemd unit pulls
 # it LOW again when the agent stops.
-READY_GPIO = 26              # header pin 37
+READY_GPIO = 21              # header pin 40 (GND: pin 34)
 
 # A trigger gap this long splits the recording into a new session directory:
 # the Arduino stops bursting when its toggle is turned OFF (end of a drying
