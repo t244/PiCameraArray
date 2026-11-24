@@ -70,6 +70,17 @@ IMAGE_FORMAT = "png"
 
 PREVIEW_WIDTH = 728          # half resolution keeps 16 streams light
 PREVIEW_HEIGHT = 544
+# 16 MJPEG streams share one pocket router. At 30 fps and the default JPEG
+# quality they need ~15 Mbit/s each, more than the 2.4 GHz band carries for
+# the Pis on it; status polls and SSH then time out and the dashboard shows
+# Pis as offline. 10 fps is plenty for focusing and cuts the load 3x.
+PREVIEW_FPS = 10
+PREVIEW_JPEG_Q = 70
+
+
+def preview_frame_us(exposure_us) -> int:
+    """Preview frame time: PREVIEW_FPS, longer only for long exposures."""
+    return max(int(exposure_us) + 1000, int(1e6 / PREVIEW_FPS))
 
 TRIGGER_MODE_PATH = "/sys/module/imx296/parameters/trigger_mode"
 SSD_MOUNT = "/media/pi/HIKSEMI"
@@ -113,7 +124,7 @@ MAX_TEMPERATURE = 90.0
 TEMP_WARNING = 80.0
 HEALTH_CHECK_INTERVAL = 50   # captures between health checks
 
-DEFAULT_EXPOSURE_US = 10000
+DEFAULT_EXPOSURE_US = 30000      # = exposure_trigger.ino DEFAULT_EXPOSURE_US
 DEFAULT_GAIN = 1.0
 
 SERIAL_BAUD = 115200
@@ -652,14 +663,15 @@ class CameraManager:
             main={"size": (PREVIEW_WIDTH, PREVIEW_HEIGHT)},
         )
         self.picam2.configure(config)
-        frame_us = max(int(self.exposure_us) + 1000, 33333)
+        frame_us = preview_frame_us(self.exposure_us)
         self.picam2.set_controls({
             "AeEnable": False,
             "FrameDurationLimits": (frame_us, frame_us),
             "ExposureTime": int(self.exposure_us),
             "AnalogueGain": float(self.gain),
         })
-        self.picam2.start_recording(JpegEncoder(), FileOutput(self.stream_output))
+        self.picam2.start_recording(JpegEncoder(q=PREVIEW_JPEG_Q),
+                                    FileOutput(self.stream_output))
         self.mode = self.MODE_PREVIEW
         self._focus_stop.clear()
         self._focus_thread = threading.Thread(target=self._focus_loop, daemon=True)
@@ -677,7 +689,7 @@ class CameraManager:
             self.gain = float(gain)
         # Extend frame duration for long exposures (default video config
         # caps exposure at the ~33ms frame time otherwise)
-        frame_us = max(int(self.exposure_us) + 1000, 33333)
+        frame_us = preview_frame_us(self.exposure_us)
         self.picam2.set_controls({
             "AeEnable": False,
             "FrameDurationLimits": (frame_us, frame_us),

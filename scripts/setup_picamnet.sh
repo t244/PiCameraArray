@@ -157,6 +157,21 @@ while IFS= read -r name; do
 done < <(wifi_profiles)
 
 # ---------------------------------------------------------------------------
+# 2b. WiFi power saving off. With it on (the Raspberry Pi OS default) the
+#     radio dozes between beacons, so requests to the Pi wait or are lost:
+#     with 16 Pis streaming previews, dashboard polls and SSH time out and
+#     Pis show as offline. NetworkManager applies this file to every WiFi
+#     profile; iw switches the live link now without dropping it.
+# ---------------------------------------------------------------------------
+cat > /etc/NetworkManager/conf.d/99-picam-wifi-powersave-off.conf <<'EOF'
+# PiCameraArray (setup_picamnet.sh): 2 = disable WiFi power saving
+[connection]
+wifi.powersave = 2
+EOF
+/usr/sbin/iw dev "$WIFI_DEV" set power_save off 2>/dev/null || true
+log "wifi power save: $(/usr/sbin/iw dev "$WIFI_DEV" get power_save 2>/dev/null || echo '?')"
+
+# ---------------------------------------------------------------------------
 # 3. mDNS - the laptop reaches the array as e00.local .. e15.local
 # ---------------------------------------------------------------------------
 if systemctl list-unit-files 2>/dev/null | grep -q '^avahi-daemon'; then

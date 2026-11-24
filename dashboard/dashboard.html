@@ -81,22 +81,24 @@
 
   <div class="ctl">
     <label>露光 (ms)</label>
-    <input type="range" id="expSlider" min="-1" max="4" step="0.01" value="1"
+    <input type="range" id="expSlider" autocomplete="off" min="-1" max="4" step="0.01" value="1.48"
            oninput="sliderChanged()">
-    <input type="number" id="expNum" value="10" min="0.1" max="10000" step="0.1"
+    <input type="number" id="expNum" autocomplete="off" value="30" min="0.1" max="10000" step="0.1"
            onchange="numChanged()">
     <label>Gain</label>
-    <input type="number" id="gainNum" value="1.0" min="1" max="16" step="0.5" style="width:60px">
+    <input type="number" id="gainNum" autocomplete="off" value="1.0" min="1" max="16" step="0.5" style="width:60px">
     <button class="gray" onclick="applyControls()">Previewに反映</button>
   </div>
 
   <div class="ctl">
     <label>周期 (s)</label>
-    <input type="number" id="periodNum" value="60" min="1" max="3600" step="1" style="width:60px">
+    <!-- Defaults = the field protocol (exposure_trigger.ino, readme):
+         30 ms exposure, 30 fps x 2 s every 120 s. -->
+    <input type="number" id="periodNum" autocomplete="off" value="120" min="1" max="3600" step="1" style="width:60px">
     <label>FPS</label>
-    <input type="number" id="fpsNum" value="30" min="1" max="60" step="1" style="width:50px">
+    <input type="number" id="fpsNum" autocomplete="off" value="30" min="1" max="60" step="1" style="width:50px">
     <label>バースト (s)</label>
-    <input type="number" id="burstNum" value="3" min="0.1" max="15" step="0.1" style="width:55px">
+    <input type="number" id="burstNum" autocomplete="off" value="2" min="0.1" max="15" step="0.1" style="width:55px">
     <button onclick="writeArduino()">Arduinoへ書込み</button>
     <button class="green" onclick="triggerCmd('start')">トリガ開始</button>
     <button class="red" onclick="triggerCmd('stop')">トリガ停止</button>
@@ -179,7 +181,7 @@ function sliderChanged() {
   $("expNum").value = rounded;
 }
 function numChanged() {
-  const ms = Math.min(10000, Math.max(0.1, parseFloat($("expNum").value) || 10));
+  const ms = Math.min(10000, Math.max(0.1, parseFloat($("expNum").value) || 30));
   $("expNum").value = ms;
   $("expSlider").value = Math.log10(ms).toFixed(2);
 }
@@ -188,8 +190,8 @@ function exposureUs() {
 }
 
 // ---- API helpers ----
-async function api(host, path, method = "GET", body = null) {
-  const opts = { method, signal: AbortSignal.timeout(8000) };
+async function api(host, path, method = "GET", body = null, timeoutMs = 8000) {
+  const opts = { method, signal: AbortSignal.timeout(timeoutMs) };
   if (body) {
     opts.headers = { "Content-Type": "application/json" };
     opts.body = JSON.stringify(body);
@@ -268,6 +270,8 @@ function showImage(i, kind, src) {
   const img = $(`img-${i}`);
   if (img.dataset.kind === kind) return;
   img.dataset.kind = kind;
+  // A stream that fails or drops is forgotten, so the next poll reopens it.
+  img.onerror = () => { if (img.dataset.kind === kind) img.dataset.kind = ""; };
   img.src = src;
   img.style.display = "";
   $(`noimg-${i}`).style.display = "none";
@@ -289,10 +293,33 @@ function detachStream(i) {
 }
 
 // ---- status polling ----
+// One poll at a time: with an 8 s timeout and a 2 s interval, a slow network
+// used to stack up overlapping requests on every Pi (seen as "SYN flooding on
+// port 8000" in the Pi's kernel log), which made the network slower still.
+// A Pi is shown offline (and its stream dropped) only after several missed
+// polls in a row, so one lost packet does not tear down and reopen the
+// MJPEG stream.
+const OFFLINE_AFTER = 3;
+const missed = [];
+let polling = false;
 async function poll() {
-  const results = await forAllHosts(h => api(h, "/status"));
+  if (polling) return;
+  polling = true;
+  try { await pollOnce(); } finally { polling = false; }
+}
+async function pollOnce() {
+  const results = await forAllHosts(h => api(h, "/status", "GET", null, 4000));
   let foundMaster = null;
   results.forEach((r, i) => {
+    if (r.status !== "fulfilled") {
+      missed[i] = (missed[i] || 0) + 1;
+      if (missed[i] < OFFLINE_AFTER) {         // keep the last state for now
+        if (hosts[i] === masterHost) foundMaster = masterHost;
+        return;
+      }
+    } else {
+      missed[i] = 0;
+    }
     const badge = $(`badge-${i}`);
     const meta = $(`meta-${i}`);
     const focus = $(`focus-${i}`);
