@@ -19,7 +19,10 @@
 #
 # Environment overrides:
 #     SSIDS      space-separated SSIDs, highest priority first
-#                (default: "PiCamNet5G PiCamNet")
+#                (default: "PiCamNet PiCamNet5G")
+#     FALLBACK_SSIDS  lab SSIDs ranked below SSIDS, highest first
+#                (default: "CIGL2.4 CIGL5.0"). Only profiles that already
+#                exist on the Pi are re-ranked; none are created.
 #     PSK        WPA2 passphrase, shared by all of them (default: PiCamNet)
 #     PRIORITY   priority of the first SSID; each later one gets one less
 #                (default: 100; higher wins)
@@ -28,7 +31,8 @@
 #
 set -euo pipefail
 
-SSIDS="${SSIDS:-PiCamNet5G PiCamNet}"
+SSIDS="${SSIDS:-PiCamNet PiCamNet5G}"
+FALLBACK_SSIDS="${FALLBACK_SSIDS-CIGL2.4 CIGL5.0}"
 PSK="${PSK:-PiCamNet}"
 PRIORITY="${PRIORITY:-100}"
 STATIC_IP="${STATIC_IP:-}"
@@ -100,6 +104,32 @@ for ssid in "${SSID_LIST[@]}"; do
     prio=$((prio - 1))
 done
 
+# ---------------------------------------------------------------------------
+# 1b. Rank existing lab profiles next, in FALLBACK_SSIDS order. A profile is
+#     matched by its name or by the SSID it connects to. Missing ones are
+#     skipped; nothing is created.
+# ---------------------------------------------------------------------------
+RANKED=("${SSID_LIST[@]}")
+read -r -a FALLBACK_LIST <<< "$FALLBACK_SSIDS"
+for fssid in "${FALLBACK_LIST[@]}"; do
+    found=0
+    while IFS= read -r name; do
+        [[ -n "$name" ]] || continue
+        cssid="$(nmcli -g 802-11-wireless.ssid connection show "$name" 2>/dev/null || true)"
+        if [[ "$name" == "$fssid" || "$cssid" == "$fssid" ]]; then
+            nmcli connection modify "$name" connection.autoconnect yes \
+                connection.autoconnect-priority "$prio"
+            log "ranked  '$name' (ssid $fssid) priority=$prio"
+            RANKED+=("$name"); found=1
+        fi
+    done < <(wifi_profiles)
+    if [[ $found -eq 1 ]]; then
+        prio=$((prio - 1))
+    else
+        log "no profile for '$fssid' - skipped"
+    fi
+done
+
 LOWEST="$prio"   # anything at or above this belongs to us
 
 # ---------------------------------------------------------------------------
@@ -109,7 +139,7 @@ LOWEST="$prio"   # anything at or above this belongs to us
 # ---------------------------------------------------------------------------
 is_ours() {
     local n="$1"
-    for s in "${SSID_LIST[@]}"; do [[ "$n" == "$s" ]] && return 0; done
+    for s in "${RANKED[@]}"; do [[ "$n" == "$s" ]] && return 0; done
     return 1
 }
 

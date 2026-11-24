@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Push the PiCamNet WiFi profile to the whole camera array.
 
@@ -42,7 +42,9 @@ param(
     [string]   $Password   = "pi",
     # The GL.iNet router splits bands into separate SSIDs. Highest priority
     # first; every one of them is registered on each Pi.
-    [string[]] $Ssids      = @("PiCamNet5G", "PiCamNet"),
+    [string[]] $Ssids      = @("PiCamNet", "PiCamNet5G"),
+    # Lab SSIDs ranked below, highest first; re-ranked only where a profile exists.
+    [string[]] $Fallback   = @("CIGL2.4", "CIGL5.0"),
     [string]   $Psk        = "PiCamNet",
     [int]      $Priority   = 100,
     [switch]   $Static,
@@ -87,7 +89,7 @@ $addressing = if ($Static) { "static $StaticBase.$StaticFrom+" } else { 'DHCP' }
 
 Write-Host "=== $mode : $($targets.Count) hosts ($($targets[0].Hostname)..$($targets[-1].Hostname)) ===" -ForegroundColor Cyan
 if ($mode -eq 'DEPLOY') {
-    Write-Host "    SSIDs=$($Ssids -join ', ')  priority=$Priority  addressing=$addressing" -ForegroundColor Cyan
+    Write-Host "    SSIDs=$($Ssids -join ', ') then $($Fallback -join ', ')  priority=$Priority  addressing=$addressing" -ForegroundColor Cyan
     Write-Host "    Make sure the pocket router is POWERED OFF before continuing." -ForegroundColor Yellow
 }
 
@@ -97,6 +99,7 @@ $cfg = @{
     User        = $User
     Password    = $Password
     Ssids       = $Ssids
+    Fallback    = $Fallback
     Psk         = $Psk
     Priority    = $Priority
     Static      = [bool]$Static
@@ -146,7 +149,7 @@ try {
         $copy = (pscp -pw $pw -batch $Cfg.LocalScript "$user@${h}:/tmp/setup_picamnet.sh" 2>&1 | Out-String)
         if ($LASTEXITCODE -ne 0) { throw "pscp failed: $($copy.Trim())" }
 
-        $envs = "SSIDS='$($Cfg.Ssids -join ' ')' PSK='$($Cfg.Psk)' PRIORITY=$($Cfg.Priority)"
+        $envs = "SSIDS='$($Cfg.Ssids -join ' ')' FALLBACK_SSIDS='$($Cfg.Fallback -join ' ')' PSK='$($Cfg.Psk)' PRIORITY=$($Cfg.Priority)"
         if ($Cfg.Static) {
             $ip = "$($Cfg.StaticBase).$($Cfg.StaticFrom + $Target.Index)/24"
             $envs += " STATIC_IP='$ip' GATEWAY='$($Cfg.Gateway)'"
