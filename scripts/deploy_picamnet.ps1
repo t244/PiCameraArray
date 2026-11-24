@@ -41,8 +41,9 @@ param(
     [string]   $User       = "pi",
     [string]   $Password   = "pi",
     # The GL.iNet router splits bands into separate SSIDs. Highest priority
-    # first; every one of them is registered on each Pi.
-    [string[]] $Ssids      = @("PiCamNet", "PiCamNet5G"),
+    # first; every one of them is registered on each Pi. 5 GHz first: 16
+    # preview streams saturate the 2.4 GHz band (2026-11-25).
+    [string[]] $Ssids      = @("PiCamNet5G", "PiCamNet"),
     # Lab SSIDs ranked below, highest first; re-ranked only where a profile exists.
     [string[]] $Fallback   = @("CIGL2.4", "CIGL5.0"),
     [string]   $Psk        = "PiCamNet",

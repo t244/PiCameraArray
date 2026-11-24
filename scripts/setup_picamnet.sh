@@ -19,7 +19,8 @@
 #
 # Environment overrides:
 #     SSIDS      space-separated SSIDs, highest priority first
-#                (default: "PiCamNet PiCamNet5G")
+#                (default: "PiCamNet5G PiCamNet" - 5 GHz first, the
+#                2.4 GHz band cannot carry 16 preview streams)
 #     FALLBACK_SSIDS  lab SSIDs ranked below SSIDS, highest first
 #                (default: "CIGL2.4 CIGL5.0"). Only profiles that already
 #                exist on the Pi are re-ranked; none are created.
@@ -31,7 +32,7 @@
 #
 set -euo pipefail
 
-SSIDS="${SSIDS:-PiCamNet PiCamNet5G}"
+SSIDS="${SSIDS:-PiCamNet5G PiCamNet}"
 FALLBACK_SSIDS="${FALLBACK_SSIDS-CIGL2.4 CIGL5.0}"
 PSK="${PSK:-PiCamNet}"
 PRIORITY="${PRIORITY:-100}"
