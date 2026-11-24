@@ -75,7 +75,7 @@ const unsigned long FAULT_LOW_MS      = 3000;    // LOW this long = Pi fault
 const unsigned long TOGGLE_DEBOUNCE_MS = 50;
 
 // Defaults used when EEPROM is uninitialized
-const unsigned long DEFAULT_EXPOSURE_US = 10000;   // 10 ms
+const unsigned long DEFAULT_EXPOSURE_US = 30000;   // 30 ms
 const unsigned long DEFAULT_PERIOD_MS   = 120000;  // 2 min between bursts
 const unsigned long DEFAULT_FPS         = 30;      // frames/s within burst
 const unsigned long DEFAULT_BURST_MS    = 2000;    // 2 s burst
